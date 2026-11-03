@@ -94,7 +94,7 @@ $(BUILD):
 TEST_OBJS = $(BUILD)/CpuKernel.o $(BUILD)/Calibration.o $(BUILD)/Tracker.o $(BUILD)/LensDecoder.o $(BUILD)/MotionBlur.o $(BUILD)/Motion.o $(BUILD)/Platform.o
 
 ifeq ($(PLATFORM),windows)
-TEST_LIBS = -L$(FFMPEG)/lib -lavformat -lavcodec -lswscale -lavutil -lz -lbcrypt
+TEST_LIBS = -L$(FFMPEG)/lib -lavformat -lavcodec -lswscale -lavutil -lz -lbcrypt -lshell32
 else
 TEST_LIBS = $(shell pkg-config --libs libavformat libavcodec libswscale libavutil)
 endif
