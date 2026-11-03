@@ -613,6 +613,117 @@ float4 StitchPixel(const StitchParams& p, const Source& src, const float4* p_Tab
     return {out.x, out.y, out.z, 1.0f};
 }
 
+// One row of the stitched or reframed picture from the decoded lenses. Same result as
+// StitchPixel, but each pixel's footprint (for filtering) comes from its neighbours in the row,
+// which are computed anyway, and from the row below at every kFootprintStep-th pixel, instead
+// of from two extra rays per pixel: the geometry is most of the work.
+const int kFootprintStep = 4;
+
+struct RowPoint
+{
+    float3 ray;
+    float4 seam;
+    float near;
+    float2 pos[2];
+    bool ok[2];
+    bool have[2]; // pos and ok of that lens are worked out
+};
+
+// The ray of an output point; its lens positions follow on demand (Have).
+void StartPoint(const StitchParams& p, const float4* p_Table, float p_X, float p_Y, RowPoint& p_Out)
+{
+    p_Out.ray = OutputRay(p, float2{p_X, p_Y});
+    p_Out.near = NearSeam(p_Out.ray);
+    // Beyond SEAM_FADE_DEG from the seam the table has no effect (near is 0): skip the lookup.
+    p_Out.seam = p_Out.near > 0.0f ? TableAt(p_Table, p_Out.ray) : float4{0, 0, 0, 0};
+    p_Out.have[0] = p_Out.have[1] = false;
+}
+
+inline void Have(const StitchParams& p, RowPoint& p_Point, int p_Lens)
+{
+    if (!p_Point.have[p_Lens])
+    {
+        p_Point.ok[p_Lens] = ProjectToLens(p, p_Lens, LensRay(p, p_Point.ray, p_Point.seam.w * p_Point.near, p_Lens == 0 ? 1.0f : -1.0f),
+                                           p_Point.pos[p_Lens]);
+        p_Point.have[p_Lens] = true;
+    }
+}
+
+void StitchRowDecoded(const StitchParams& p, const Source& src, const float4* p_Table, int p_Row, int p_X1, int p_X2,
+                      std::vector<RowPoint>& p_Points, const FrameOutput& p_Out)
+{
+    const int yTop = p.flipY != 0 ? p.height - 1 - p_Row : p_Row;
+    const int n = p_X2 - p_X1;
+    p_Points.resize(size_t(n) + 1);
+    for (int i = 0; i <= n; ++i)
+    {
+        StartPoint(p, p_Table, float(p_X1 + i), float(yTop), p_Points[i]);
+    }
+    const float3 overall = rgb(p_Table[SEAM_BINS]);
+    // The step to the row below, measured at every kFootprintStep-th pixel and used for the
+    // pixels up to the next one (it changes slowly along a row).
+    RowPoint below;
+    int belowAt = -1;
+    float2 dyAt[2] = {{0, 0}, {0, 0}};
+    bool dyKnown[2] = {false, false};
+    for (int i = 0; i < n; ++i)
+    {
+        RowPoint& pt = p_Points[i];
+        RowPoint& right = p_Points[i + 1];
+        // Away from the seam one lens decides the pixel; the other is only needed where that one
+        // does not see it, or within the blend band (same weights as StitchPixel).
+        const int main = pt.ray.z >= 0.0f ? 0 : 1, other = 1 - main;
+        Have(p, pt, main);
+        if (!pt.ok[main] || std::fabs(pt.ray.z) < p.blendBand)
+        {
+            Have(p, pt, other);
+        }
+        else
+        {
+            pt.ok[other] = false; // its weight would be 0
+        }
+        const bool okA = pt.ok[0], okB = pt.ok[1];
+        float wA = smoothstep(-p.blendBand, p.blendBand, pt.ray.z);
+        wA = okA ? (okB ? wA : 1.0f) : 0.0f;
+        const float wB = okB ? (okA ? 1.0f - wA : 1.0f) : 0.0f;
+        if (i - belowAt >= kFootprintStep || belowAt < 0)
+        {
+            StartPoint(p, p_Table, float(p_X1 + i), float(yTop) + 1.0f, below);
+            belowAt = i;
+            dyKnown[0] = dyKnown[1] = false;
+        }
+        const float3 root = p.gainMatch != 0 ? sqrt3(overall + (rgb(pt.seam) - overall) * pt.near) : float3{1, 1, 1};
+        float3 sum = {0, 0, 0};
+        const float w[2] = {wA, wB};
+        for (int l = 0; l < 2; ++l)
+        {
+            if (w[l] <= 0.0f)
+            {
+                continue;
+            }
+            Have(p, right, l);
+            if (!dyKnown[l])
+            {
+                RowPoint& above = p_Points[belowAt];
+                Have(p, above, l);
+                Have(p, below, l);
+                dyAt[l] = above.ok[l] && below.ok[l] ? below.pos[l] - above.pos[l] : float2{0, 0};
+                dyKnown[l] = true;
+            }
+            const float2 dx = right.ok[l] ? right.pos[l] - pt.pos[l] : float2{0, 0};
+            const float2 dy = dyAt[l];
+            const float3 c = SampleSource(src, p, l, pt.pos[l], dx, dy, -1.0f);
+            sum = sum + (l == 0 ? c / root : c * root) * w[l];
+        }
+        const float3 out = sum / std::max(wA + wB, 1e-6f);
+        float* px = reinterpret_cast<float*>(p_Out.data + long(p_Row) * p_Out.rowBytes) + (p_X1 + i) * 4;
+        px[0] = out.x;
+        px[1] = out.y;
+        px[2] = out.z;
+        px[3] = 1.0f;
+    }
+}
+
 inline void WritePixel(const FrameOutput& p_Out, int p_Row, int p_X, float4 p_Px)
 {
     float* px = reinterpret_cast<float*>(p_Out.data + long(p_Row) * p_Out.rowBytes) + p_X * 4;
@@ -677,6 +788,14 @@ bool RunStitchKernel(const StitchParams& p_Params, const FrameBuffer& p_Input, c
         }
         // The seam pass found whether the decoded frame is the input's.
         const Source src = {decoded && table[kSeamBins + 1].x > 0.5f, &p_Input, decoded ? p_Lenses : nullptr};
+        if (src.decoded)
+        {
+            ParallelFor(win.y2 - win.y1, 2, [&](int i) {
+                thread_local std::vector<RowPoint> points;
+                StitchRowDecoded(params, src, table, win.y1 + i, win.x1, win.x2, points, p_Output);
+            });
+            return true;
+        }
         ParallelFor(win.y2 - win.y1, 2, [&](int i) {
             const int row = win.y1 + i;
             for (int x = win.x1; x < win.x2; ++x)

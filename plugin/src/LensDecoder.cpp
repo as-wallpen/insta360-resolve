@@ -43,6 +43,47 @@ double SecondsNow()
     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+// Sample buffers are recycled: a frame pair needs about 120 MB, and memory fresh from the
+// system is slow to fill on Windows (every page is faulted in and zeroed first).
+const size_t kKeepBufferBytes = size_t(768) << 20;
+std::mutex s_BufferMutex;
+std::vector<std::vector<uint16_t>> s_Buffers;
+size_t s_BufferBytes = 0;
+
+// A buffer of p_Size samples, recycled if one of that size is free; its contents are undefined.
+std::vector<uint16_t> TakeBuffer(size_t p_Size)
+{
+    {
+        std::lock_guard<std::mutex> lock(s_BufferMutex);
+        for (size_t i = 0; i < s_Buffers.size(); ++i)
+        {
+            if (s_Buffers[i].size() == p_Size)
+            {
+                std::vector<uint16_t> out = std::move(s_Buffers[i]);
+                s_Buffers.erase(s_Buffers.begin() + long(i));
+                s_BufferBytes -= p_Size * sizeof(uint16_t);
+                return out;
+            }
+        }
+    }
+    return std::vector<uint16_t>(p_Size);
+}
+
+void GiveBack(std::vector<uint16_t>& p_Buffer)
+{
+    const size_t bytes = p_Buffer.size() * sizeof(uint16_t);
+    std::lock_guard<std::mutex> lock(s_BufferMutex);
+    if (bytes > 0 && s_BufferBytes + bytes <= kKeepBufferBytes)
+    {
+        s_BufferBytes += bytes;
+        s_Buffers.push_back(std::move(p_Buffer));
+    }
+}
+
+// Time spent per lens frame in copying it from the GPU and converting it, for the log.
+std::atomic<int64_t> s_TransferMicros{0}, s_ConvertMicros{0};
+std::atomic<int> s_LensFrames{0};
+
 // One lens of one frame: level 0 as decoded, further mip levels built on first use.
 struct DecodedLens
 {
@@ -50,6 +91,17 @@ struct DecodedLens
     MipChain chroma;
     int bits = 8;
     std::once_flag mips;
+
+    ~DecodedLens()
+    {
+        for (MipChain* chain : {&luma, &chroma})
+        {
+            for (MipLevel& level : chain->levels)
+            {
+                GiveBack(level.data);
+            }
+        }
+    }
 
     void buildMips()
     {
@@ -116,68 +168,102 @@ std::shared_ptr<DecodedLens> Convert(const AVFrame* p_Frame)
     y.height = h;
     c.width = cw;
     c.height = ch;
-    y.data.resize(size_t(w) * h);
-    c.data.resize(size_t(cw) * ch * 2);
+    y.data = TakeBuffer(size_t(w) * h);
+    c.data = TakeBuffer(size_t(cw) * ch * 2);
     // The X5 records full range; a file that says otherwise is expanded to full range.
     const bool limited = p_Frame->color_range == AVCOL_RANGE_MPEG && format != AV_PIX_FMT_YUVJ420P;
 
-    ParallelFor(h, 64, [&](int row) {
+    // One loop per layout, so that the common cases (8-bit NV12 from the GPU, full range) are
+    // plain copies the compiler can vectorise.
+    const auto lumaRow = [&](int row) {
         uint16_t* out = &y.data[size_t(row) * w];
         const uint8_t* in = p_Frame->data[0] + long(row) * p_Frame->linesize[0];
-        for (int x = 0; x < w; ++x)
+        if (bits == 8)
         {
-            uint16_t v;
+            for (int x = 0; x < w; ++x)
+            {
+                out[x] = uint16_t(in[x] * 257u);
+            }
+        }
+        else if (format == AV_PIX_FMT_P010LE)
+        {
+            const uint16_t* in16 = reinterpret_cast<const uint16_t*>(in);
+            for (int x = 0; x < w; ++x)
+            {
+                out[x] = Expand10(in16[x] >> 6);
+            }
+        }
+        else
+        {
+            const uint16_t* in16 = reinterpret_cast<const uint16_t*>(in);
+            for (int x = 0; x < w; ++x)
+            {
+                out[x] = Expand10(in16[x]);
+            }
+        }
+        if (limited)
+        {
+            for (int x = 0; x < w; ++x)
+            {
+                out[x] = FullRange(float(out[x]), false);
+            }
+        }
+    };
+    const auto chromaRow = [&](int row) {
+        uint16_t* out = &c.data[size_t(row) * cw * 2];
+        if (planar)
+        {
+            const uint8_t* u = p_Frame->data[1] + long(row) * p_Frame->linesize[1];
+            const uint8_t* v = p_Frame->data[2] + long(row) * p_Frame->linesize[2];
+            for (int x = 0; x < cw; ++x)
+            {
+                if (bits == 8)
+                {
+                    out[x * 2] = uint16_t(u[x] * 257u);
+                    out[x * 2 + 1] = uint16_t(v[x] * 257u);
+                }
+                else
+                {
+                    out[x * 2] = Expand10(reinterpret_cast<const uint16_t*>(u)[x]);
+                    out[x * 2 + 1] = Expand10(reinterpret_cast<const uint16_t*>(v)[x]);
+                }
+            }
+        }
+        else
+        {
+            const uint8_t* uv = p_Frame->data[1] + long(row) * p_Frame->linesize[1];
             if (bits == 8)
             {
-                v = uint16_t(in[x] * 257u);
-            }
-            else if (format == AV_PIX_FMT_P010LE)
-            {
-                v = Expand10(reinterpret_cast<const uint16_t*>(in)[x] >> 6);
+                for (int x = 0; x < cw * 2; ++x)
+                {
+                    out[x] = uint16_t(uv[x] * 257u);
+                }
             }
             else
             {
-                v = Expand10(reinterpret_cast<const uint16_t*>(in)[x]);
+                const uint16_t* uv16 = reinterpret_cast<const uint16_t*>(uv);
+                for (int x = 0; x < cw * 2; ++x)
+                {
+                    out[x] = Expand10(uv16[x] >> 6);
+                }
             }
-            out[x] = limited ? FullRange(float(v), false) : v;
         }
-    });
-    ParallelFor(ch, 64, [&](int row) {
-        uint16_t* out = &c.data[size_t(row) * cw * 2];
-        for (int x = 0; x < cw; ++x)
+        if (limited)
         {
-            uint16_t cb, cr;
-            if (planar)
+            for (int x = 0; x < cw * 2; ++x)
             {
-                const uint8_t* u = p_Frame->data[1] + long(row) * p_Frame->linesize[1];
-                const uint8_t* v = p_Frame->data[2] + long(row) * p_Frame->linesize[2];
-                if (bits == 8)
-                {
-                    cb = uint16_t(u[x] * 257u);
-                    cr = uint16_t(v[x] * 257u);
-                }
-                else
-                {
-                    cb = Expand10(reinterpret_cast<const uint16_t*>(u)[x]);
-                    cr = Expand10(reinterpret_cast<const uint16_t*>(v)[x]);
-                }
+                out[x] = FullRange(float(out[x]), true);
             }
-            else
-            {
-                const uint8_t* uv = p_Frame->data[1] + long(row) * p_Frame->linesize[1];
-                if (bits == 8)
-                {
-                    cb = uint16_t(uv[x * 2] * 257u);
-                    cr = uint16_t(uv[x * 2 + 1] * 257u);
-                }
-                else
-                {
-                    cb = Expand10(reinterpret_cast<const uint16_t*>(uv)[x * 2] >> 6);
-                    cr = Expand10(reinterpret_cast<const uint16_t*>(uv)[x * 2 + 1] >> 6);
-                }
-            }
-            out[x * 2] = limited ? FullRange(float(cb), true) : cb;
-            out[x * 2 + 1] = limited ? FullRange(float(cr), true) : cr;
+        }
+    };
+    ParallelFor(h + ch, 64, [&](int row) {
+        if (row < h)
+        {
+            lumaRow(row);
+        }
+        else
+        {
+            chromaRow(row - h);
         }
     });
     return lens;
@@ -440,6 +526,7 @@ private:
                 if (index > p_Wanted - kKeepDecoded)
                 {
                     const AVFrame* frame = m_Decoded;
+                    const double transferStart = SecondsNow();
                     if (m_Decoded->hw_frames_ctx)
                     {
                         av_frame_unref(m_Transfer);
@@ -450,7 +537,11 @@ private:
                         }
                         frame = m_Transfer;
                     }
+                    const double convertStart = SecondsNow();
                     std::shared_ptr<DecodedLens> lens = ok ? Convert(frame) : nullptr;
+                    s_TransferMicros += int64_t((convertStart - transferStart) * 1e6);
+                    s_ConvertMicros += int64_t((SecondsNow() - convertStart) * 1e6);
+                    ++s_LensFrames;
                     ok = lens != nullptr;
                     if (ok)
                     {
@@ -596,7 +687,7 @@ void BuildMipLevels(MipChain& p_Chain)
         MipLevel dst;
         dst.width = std::max(1, src.width / 2);
         dst.height = std::max(1, src.height / 2);
-        dst.data.resize(size_t(dst.width) * dst.height * ch);
+        dst.data = TakeBuffer(size_t(dst.width) * dst.height * ch);
         ParallelFor(dst.height, 32, [&](int y) {
             const int y0 = std::min(2 * y, src.height - 1), y1 = std::min(2 * y + 1, src.height - 1);
             for (int x = 0; x < dst.width; ++x)
@@ -750,11 +841,13 @@ bool AcquireLensImages(const std::string& p_LensA, const std::string& p_LensB, i
 std::string LensDecoderStats()
 {
     std::lock_guard<std::mutex> lock(s_StatsMutex);
-    char line[256];
+    char line[400];
     const int n = std::max(s_StatFrames, 1);
-    snprintf(line, sizeof(line), "decoder %s (%d of %d frames on the GPU), %.0f ms decoding, %.0f ms mip levels per frame",
+    const int lensFrames = std::max(s_LensFrames.exchange(0), 1);
+    snprintf(line, sizeof(line),
+             "decoder %s (%d of %d frames on the GPU), %.0f ms decoding, %.0f ms mip levels per frame; per lens %.1f ms copying from the GPU, %.1f ms converting",
              s_HardwareName.empty() ? "software" : s_HardwareName.c_str(), s_HardwareFrames, s_StatFrames, s_DecodeSeconds * 1000.0 / n,
-             s_MipSeconds * 1000.0 / n);
+             s_MipSeconds * 1000.0 / n, s_TransferMicros.exchange(0) / 1000.0 / lensFrames, s_ConvertMicros.exchange(0) / 1000.0 / lensFrames);
     s_DecodeSeconds = s_MipSeconds = 0.0;
     s_StatFrames = s_HardwareFrames = 0;
     return line;

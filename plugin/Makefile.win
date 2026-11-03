@@ -13,7 +13,7 @@ PLATFORM ?= windows
 NAME     = Insta360Stitch
 VERSION := $(shell sed -n '/CFBundleShortVersionString/{n;s/.*<string>\(.*\)<\/string>.*/\1/p;}' Info.plist)
 OFX_INC  = -Ithird_party/openfx-include -Ithird_party/openfx-support/include -Ithird_party/openfx-support/Library
-COMMON   = -std=gnu++17 -O2 -fno-math-errno -D_USE_MATH_DEFINES -DPLUGIN_VERSION='"$(VERSION)"' $(OFX_INC) -Isrc -Wall -Wno-unused-parameter \
+COMMON   = -std=gnu++17 -O3 -fno-math-errno -D_USE_MATH_DEFINES -DPLUGIN_VERSION='"$(VERSION)"' $(OFX_INC) -Isrc -Wall -Wno-unused-parameter \
            -Wno-sign-compare -Wno-unused-variable -Wno-unused-but-set-variable -Wno-deprecated-declarations -Wno-misleading-indentation
 
 ifeq ($(PLATFORM),windows)

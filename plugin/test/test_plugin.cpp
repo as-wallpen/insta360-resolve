@@ -803,6 +803,61 @@ int main(int argc, char** argv)
     {
         return StitchFile(argc, argv);
     }
+    if (argc >= 2 && strcmp(argv[1], "--bench") == 0)
+    {
+        // test_plugin --bench: the stitch of a 1920x1080 reframe from synthetic 3840 x 3840 lenses,
+        // with and without the seam analysis, as the plugin renders during playback.
+        auto make = [](int w, int h, int ch) {
+            auto chain = std::make_shared<MipChain>();
+            chain->channels = ch;
+            chain->levels.resize(1);
+            chain->levels[0].width = w;
+            chain->levels[0].height = h;
+            chain->levels[0].data.resize(size_t(w) * h * ch);
+            uint32_t r = 12345;
+            for (uint16_t& v : chain->levels[0].data)
+            {
+                r = r * 1664525u + 1013904223u;
+                v = uint16_t(20000 + (r >> 20));
+            }
+            BuildMipLevels(*chain);
+            return chain;
+        };
+        auto lumaA = make(3840, 3840, 1), chromaA = make(1920, 1920, 2), lumaB = make(3840, 3840, 1), chromaB = make(1920, 1920, 2);
+        LensImages images;
+        images.planes[0] = lumaA.get();
+        images.planes[1] = chromaA.get();
+        images.planes[2] = lumaB.get();
+        images.planes[3] = chromaB.get();
+        images.width = images.height = 3840;
+        LensCalibration lenses[2];
+        ParseCalibration(kNominalX5Calibration, lenses);
+        StitchParams params = {};
+        params.width = 1920;
+        params.height = 1080;
+        params.mode = eModeReframe;
+        params.flipY = 1;
+        params.blendBand = float(sin(2.0 * M_PI / 180.0));
+        FillViewParams(0.0, 0.0, 0.0, 110.0, 0.25, 16.0 / 9.0, params);
+        FillLensOffset(lenses, params);
+        SetUpFullRes(images, lenses, params);
+        params.trustDecoded = 1;
+        std::vector<float> in(size_t(1920) * 1080 * 4, 0.5f), out;
+        for (int seam = 1; seam >= 0; --seam)
+        {
+            params.gainMatch = seam;
+            params.autoDistance = seam;
+            RunKernelWith(params, in, out, &images);
+            const double start = Seconds();
+            for (int i = 0; i < 10; ++i)
+            {
+                RunKernelWith(params, in, out, &images);
+            }
+            printf("stitch 1920x1080 reframe from 3840 lenses, %s: %.1f ms\n", seam ? "with seam analysis" : "without seam analysis",
+                   (Seconds() - start) * 100.0);
+        }
+        return 0;
+    }
     if (argc == 5 && strcmp(argv[1], "--tag") == 0)
     {
         // test_plugin --tag frame.raw width height: the clip number in a frame (float RGBA, top row first)
