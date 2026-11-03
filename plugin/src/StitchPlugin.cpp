@@ -1738,8 +1738,8 @@ void StitchPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, 
     stitchDistance->setHint("Distance in metres at which the two lenses line up, when Auto Stitch Distance is off. "
                             "Things nearer or further away show a small step at the seam.");
     stitchDistance->setDefault(2.0);
-    stitchDistance->setRange(0.3, 1000.0);
-    stitchDistance->setDisplayRange(0.3, 10.0);
+    stitchDistance->setRange(0.25, 1000.0);
+    stitchDistance->setDisplayRange(0.25, 100.0); // Resolve will not take a typed value beyond the display range
     stitchDistance->setIncrement(0.1);
     page->addChild(*stitchDistance);
 

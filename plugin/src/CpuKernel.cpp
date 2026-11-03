@@ -26,10 +26,11 @@ const int SEAM_BINS = kSeamBins;     // table entries around the seam; entry SEA
 const float SEAM_FADE_DEG = 30.0f;   // the corrections fade out between the band edge and this distance from the seam
 const float GAIN_SIGMA_DEG = 15.0f;  // smoothing of the gain along the seam
 const float GAIN_PRIOR = 64.0f;      // pulls entries with few usable samples towards the global gain
-const int DEPTH_STEPS = 12;          // candidate stitch distances, evenly spaced in 1 / distance ...
-const float MAX_INV_DISTANCE = 2.5f; // ... from infinity to 0.4 m
+const int DEPTH_STEPS = 18;          // candidate stitch distances, evenly spaced in 1 / distance ...
+const float MAX_INV_DISTANCE = 4.0f; // ... from infinity to 0.25 m (cameras set down in grass, on a stick close to things)
 const float DEPTH_SIGMA_DEG = 12.0f; // the match of each candidate is pooled over this much of the seam
-const float DEPTH_PRIOR = 0.05f;     // cost per 1/m away from DEFAULT_INV_DISTANCE: keeps flat areas put and frames steady
+const float DEPTH_PRIOR = 0.02f;     // cost per 1/m away from DEFAULT_INV_DISTANCE: keeps flat areas put and frames steady
+                                     // (0.05 in 0.4.1 held textured ground near the camera at about 2 m)
 const float DEFAULT_INV_DISTANCE = 0.5f;
 const float DEPTH_TABLE_SIGMA_DEG = 4.0f;
 const int MATCH_GRID = 32;           // points per side and lens where the decoded lenses are compared with the input

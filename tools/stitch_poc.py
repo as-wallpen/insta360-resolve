@@ -93,7 +93,8 @@ def project(lens, rays, video_w, f_div, c_div, dtype=np.float32):
     return u.astype(dtype), v.astype(dtype), ok
 
 
-# Seam analysis, mirrored by SeamKernel in plugin/src/MetalKernel.mm: the stitch distance and the
+# Seam analysis, mirrored by SeamPass in plugin/src/CpuKernel.cpp (SeamKernel in MetalKernel.mm still
+# searches only to 0.4 m with the stronger pull of 0.4.1): the stitch distance and the
 # colour difference between the lenses, measured on a grid of rays around the seam each frame.
 SEAM_COLUMNS = 256      # samples around the seam ...
 SEAM_ROWS = 32          # ... and across it, within +-SEAM_BAND_DEG (the lenses overlap about +-6)
@@ -102,10 +103,10 @@ SEAM_BINS = 64          # table entries around the seam
 SEAM_FADE_DEG = 30.0    # the corrections fade out between the band edge and this distance from the seam
 GAIN_SIGMA_DEG = 15.0   # smoothing of the gain along the seam
 GAIN_PRIOR = 64.0       # pulls bins with few usable samples towards the global gain
-DEPTH_STEPS = 12        # candidate stitch distances, evenly spaced in 1 / distance ...
-MAX_INV_DISTANCE = 2.5  # ... from infinity to 0.4 m
+DEPTH_STEPS = 18        # candidate stitch distances, evenly spaced in 1 / distance ...
+MAX_INV_DISTANCE = 4.0  # ... from infinity to 0.25 m
 DEPTH_SIGMA_DEG = 12.0  # the match of each candidate is pooled over this much of the seam
-DEPTH_PRIOR = 0.05      # cost per 1/m away from DEFAULT_DISTANCE: keeps flat areas put and frames steady
+DEPTH_PRIOR = 0.02      # cost per 1/m away from DEFAULT_DISTANCE: keeps flat areas put and frames steady
 DEFAULT_DISTANCE = 2.0  # metres; also the plugin's Stitch Distance default
 DEPTH_TABLE_SIGMA_DEG = 4.0
 
