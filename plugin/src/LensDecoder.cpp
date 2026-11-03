@@ -20,6 +20,7 @@ extern "C"
 #include <cmath>
 #include <cstring>
 #include <deque>
+#include <future>
 #include <list>
 #include <map>
 #include <mutex>
@@ -32,7 +33,8 @@ namespace
 {
 const int kKeepDecoded = 4;      // recent frames kept per lens, for renders that arrive out of order
 const int kReadAheadLimit = 30;  // frames read on rather than seeking to the frame
-const int kKeepFrames = 3;       // frames kept ready to sample, for re-renders of the same frame
+const int kKeepFrames = 6;       // frames kept ready to sample: re-renders, motion blur's neighbours, frames decoded ahead
+const int kDecodeAhead = 2;      // frames decoded ahead of the one asked for, during playback
 const double kIdleSeconds = 10.0; // readers and frames unused this long are released
 const double kSweepEvery = 5.0;
 
@@ -612,6 +614,107 @@ void BuildMipLevels(MipChain& p_Chain)
     }
 }
 
+namespace
+{
+// Decodes both lenses of a frame and builds their mip levels; null if that fails.
+std::shared_ptr<FramePair> DecodePair(const std::shared_ptr<LensReader> p_Readers[2], int p_Frame)
+{
+    // Both lenses at once; each reader has its own lock, so concurrent renders of other frames
+    // wait only for the lens they need.
+    auto pair = std::make_shared<FramePair>();
+    const double decodeStart = SecondsNow();
+    ParallelFor(2, 1, [&](int i) { pair->lens[i] = p_Readers[i]->frame(p_Frame); });
+    const double decoded = SecondsNow();
+    if (!pair->lens[0] || !pair->lens[1])
+    {
+        return nullptr;
+    }
+    const MipLevel& a = pair->lens[0]->luma.levels[0];
+    const MipLevel& b = pair->lens[1]->luma.levels[0];
+    if (a.width != b.width || a.height != b.height || pair->lens[0]->bits != pair->lens[1]->bits)
+    {
+        return nullptr;
+    }
+    ParallelFor(2, 1, [&](int i) { pair->lens[i]->buildMips(); });
+
+    std::lock_guard<std::mutex> lock(s_StatsMutex);
+    s_DecodeSeconds += decoded - decodeStart;
+    s_MipSeconds += SecondsNow() - decoded;
+    ++s_StatFrames;
+    const std::string hw = p_Readers[0]->hardwareName();
+    if (!hw.empty())
+    {
+        ++s_HardwareFrames;
+        s_HardwareName = hw;
+    }
+    return pair;
+}
+
+// Frames being decoded right now (by a render or ahead of one), so that nobody decodes a frame twice.
+std::map<std::pair<std::string, int>, std::shared_future<std::shared_ptr<FramePair>>> s_InFlight;
+
+// A frame from the cache, from a decode under way, or decoded here. With p_Ahead, only starts a
+// decode that is not under way already and returns null right away (for decoding ahead).
+std::shared_ptr<FramePair> Obtain(const std::string& p_Clip, const std::string& p_LensA, const std::string& p_LensB, int p_Frame, bool p_Ahead)
+{
+    std::shared_ptr<LensReader> readers[2];
+    std::promise<std::shared_ptr<FramePair>> promise;
+    std::shared_future<std::shared_ptr<FramePair>> pending;
+    {
+        std::lock_guard<std::mutex> lock(s_Mutex);
+        for (auto it = s_Frames.begin(); it != s_Frames.end(); ++it)
+        {
+            if (it->frame == p_Frame && it->clip == p_Clip)
+            {
+                if (p_Ahead)
+                {
+                    return nullptr;
+                }
+                it->lastUsed = SecondsNow();
+                s_Frames.splice(s_Frames.begin(), s_Frames, it);
+                return it->pair;
+            }
+        }
+        const auto key = std::make_pair(p_Clip, p_Frame);
+        const auto running = s_InFlight.find(key);
+        if (running != s_InFlight.end())
+        {
+            if (p_Ahead)
+            {
+                return nullptr;
+            }
+            pending = running->second;
+        }
+        else
+        {
+            s_InFlight[key] = promise.get_future().share();
+            readers[0] = ReaderFor(p_LensA);
+            readers[1] = ReaderFor(p_LensB);
+        }
+    }
+    if (pending.valid())
+    {
+        return pending.get(); // decoded by someone else meanwhile
+    }
+
+    std::shared_ptr<FramePair> pair = DecodePair(readers, p_Frame);
+    {
+        std::lock_guard<std::mutex> lock(s_Mutex);
+        s_InFlight.erase(std::make_pair(p_Clip, p_Frame));
+        if (pair)
+        {
+            s_Frames.push_front(CachedFrame{p_Clip, p_Frame, SecondsNow(), pair});
+            while (int(s_Frames.size()) > kKeepFrames)
+            {
+                s_Frames.pop_back();
+            }
+        }
+    }
+    promise.set_value(pair);
+    return pair;
+}
+}
+
 bool AcquireLensImages(const std::string& p_LensA, const std::string& p_LensB, int p_Frame, LensImages& p_Images)
 {
     if (p_Frame < 0 || p_LensA.empty() || p_LensB.empty())
@@ -620,67 +723,16 @@ bool AcquireLensImages(const std::string& p_LensA, const std::string& p_LensB, i
     }
     SweepIdle();
     const std::string clip = p_LensA + "\n" + p_LensB;
-
-    std::shared_ptr<FramePair> pair;
-    std::shared_ptr<LensReader> readers[2];
-    {
-        std::lock_guard<std::mutex> lock(s_Mutex);
-        for (auto it = s_Frames.begin(); it != s_Frames.end(); ++it)
-        {
-            if (it->frame == p_Frame && it->clip == clip)
-            {
-                it->lastUsed = SecondsNow();
-                pair = it->pair;
-                s_Frames.splice(s_Frames.begin(), s_Frames, it);
-                break;
-            }
-        }
-        readers[0] = ReaderFor(p_LensA);
-        readers[1] = ReaderFor(p_LensB);
-    }
-
+    const std::shared_ptr<FramePair> pair = Obtain(clip, p_LensA, p_LensB, p_Frame, false);
     if (!pair)
     {
-        // Both lenses at once; each reader has its own lock, so concurrent renders of other
-        // frames wait only for the lens they need.
-        pair = std::make_shared<FramePair>();
-        const double decodeStart = SecondsNow();
-        std::thread other([&]() { pair->lens[1] = readers[1]->frame(p_Frame); });
-        pair->lens[0] = readers[0]->frame(p_Frame);
-        other.join();
-        const double decoded = SecondsNow();
-        if (!pair->lens[0] || !pair->lens[1])
-        {
-            return false;
-        }
-        const MipLevel& a = pair->lens[0]->luma.levels[0];
-        const MipLevel& b = pair->lens[1]->luma.levels[0];
-        if (a.width != b.width || a.height != b.height || pair->lens[0]->bits != pair->lens[1]->bits)
-        {
-            return false;
-        }
-        std::thread mips([&]() { pair->lens[1]->buildMips(); });
-        pair->lens[0]->buildMips();
-        mips.join();
-        {
-            std::lock_guard<std::mutex> lock(s_StatsMutex);
-            s_DecodeSeconds += decoded - decodeStart;
-            s_MipSeconds += SecondsNow() - decoded;
-            ++s_StatFrames;
-            const std::string hw = readers[0]->hardwareName();
-            if (!hw.empty())
-            {
-                ++s_HardwareFrames;
-                s_HardwareName = hw;
-            }
-        }
-
-        std::lock_guard<std::mutex> lock(s_Mutex);
-        s_Frames.push_front(CachedFrame{clip, p_Frame, SecondsNow(), pair});
-        while (int(s_Frames.size()) > kKeepFrames)
-        {
-            s_Frames.pop_back();
-        }
+        return false;
+    }
+    // Playback asks for the next frame next: decode it now, on a worker, while this one renders.
+    for (int ahead = 1; ahead <= kDecodeAhead; ++ahead)
+    {
+        const int next = p_Frame + ahead;
+        WorkerPool::Get().submit([clip, p_LensA, p_LensB, next]() { Obtain(clip, p_LensA, p_LensB, next, true); });
     }
 
     for (int i = 0; i < 2; ++i)

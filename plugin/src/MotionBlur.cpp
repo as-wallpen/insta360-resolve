@@ -335,9 +335,7 @@ bool RunMotionBlur(int p_Width, int p_Height, bool p_Wrap, float p_Amount, const
             flows[i].width = flows[i].height = 1;
         }
     };
-    std::thread other(measure, 1);
-    measure(0);
-    other.join();
+    ParallelFor(2, 1, measure);
     if (!ok[0] || !ok[1])
     {
         return false;
