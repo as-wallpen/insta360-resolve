@@ -102,7 +102,7 @@ Section "Insta360 Stitch" SecMain
   WriteRegStr HKLM "${UNINSTKEY}" "DisplayName" "${APPNAME}"
   WriteRegStr HKLM "${UNINSTKEY}" "DisplayVersion" "${VERSION}"
   WriteRegStr HKLM "${UNINSTKEY}" "Publisher" "insta360-resolve (open source)"
-  WriteRegStr HKLM "${UNINSTKEY}" "URLInfoAbout" "https://github.com/Ilias823/insta360-resolve"
+  WriteRegStr HKLM "${UNINSTKEY}" "URLInfoAbout" "https://github.com/as-wallpen/insta360-resolve"
   WriteRegStr HKLM "${UNINSTKEY}" "InstallLocation" "${SUPPORT}"
   WriteRegStr HKLM "${UNINSTKEY}" "UninstallString" '"${SUPPORT}\Uninstall.exe"'
   WriteRegDWORD HKLM "${UNINSTKEY}" "NoModify" 1

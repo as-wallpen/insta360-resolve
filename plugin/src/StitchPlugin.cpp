@@ -63,7 +63,7 @@
 #define kParamDonate "donate"
 #define kDonateUrl "https://ko-fi.com/ilias823"
 #define kParamCheckUpdate "checkForUpdates"
-#define kUpdateRepo "Ilias823/insta360-resolve" // GitHub repository whose releases are checked
+#define kUpdateRepo "as-wallpen/insta360-resolve" // GitHub repository whose releases are checked (the Windows fork)
 #ifndef PLUGIN_VERSION
 #define PLUGIN_VERSION "0.0.0" // set by the Makefile from Info.plist
 #endif
