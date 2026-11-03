@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <memory>
+#include <vector>
 
 enum StitchMode
 {
@@ -25,11 +26,10 @@ enum LensSlot
     eLensSlotCount = eLensRot + 9
 };
 
-// Size of the per-frame seam table; SEAM_BINS in the shader source in MetalKernel.mm.
+// Size of the per-frame seam table; SEAM_BINS in CpuKernel.cpp.
 const int kSeamBins = 64;
 
-// Parameters for the Metal kernel. Only 4-byte fields, so the layout is identical to the
-// struct of the same name in the shader source in MetalKernel.mm.
+// Parameters for the stitch kernel (CpuKernel.cpp; the macOS original ran the same maths in Metal).
 struct StitchParams
 {
     int width;      // frame size in pixels; buffers are tightly packed RGBA float
@@ -52,7 +52,7 @@ struct StitchParams
     int lensWidth;   // size of one decoded lens picture in pixels, fullRes only; lens is scaled to it
     int lensHeight;
     float seamLod;   // mip level the seam analysis reads, fullRes only
-    float yuvScale;  // decoded texture value * yuvScale = code value / (2^bits - 1)
+    float yuvScale;  // decoded sample value * yuvScale = code value / (2^bits - 1); 1 for LensDecoder.cpp
     float chromaMid; // zero chroma as code value / (2^bits - 1)
     int trustDecoded; // 1 = use the decoded lenses without comparing them with the input, fullRes only
 };
@@ -60,7 +60,7 @@ struct StitchParams
 struct LensImages;
 
 // How often the decoded lenses matched the input picture (the kernel checks on every frame and
-// uses the input when they do not). Counted when the GPU has finished.
+// uses the input when they do not).
 struct FullResCheck
 {
     std::atomic<int> matched{0};
@@ -68,14 +68,49 @@ struct FullResCheck
     std::atomic<float> lastDiff{0.0f}; // mean brightness difference of the last check, 0..1
 };
 
-// Reads the clip tag (ClipTag.h) from the source frame; returns the clip number or -1. Waits for the GPU.
-int ReadClipTagMetal(void* p_CmdQ, const StitchParams& p_Params, const float* p_Input);
+// A host image of RGBA float pixels. Row 0 is the first row in memory; with StitchParams::flipY
+// that is the bottom of the picture (OpenFX). rowBytes may be larger than width * 16.
+struct FrameBuffer
+{
+    const unsigned char* data = nullptr;
+    int width = 0;
+    int height = 0;
+    long rowBytes = 0;
+};
 
-// Runs the kernel on host-provided MTLBuffers. Returns false if the shader failed to build.
-// With p_Params.fullRes the lenses are read from p_Lenses instead of p_Input.
-bool RunStitchMetalKernel(void* p_CmdQ, const StitchParams& p_Params, const float* p_Input, float* p_Output,
-                          const LensImages* p_Lenses = nullptr, std::shared_ptr<FullResCheck> p_Check = nullptr);
+struct FrameOutput
+{
+    unsigned char* data = nullptr;
+    int width = 0;
+    int height = 0;
+    long rowBytes = 0;
+};
 
-// Smears p_Output, in place, along the movement in two id<MTLTexture> of RG32Float (MotionBlur.h).
-// p_Wrap: the left and right edges meet, as in a 360 picture. Commits without waiting.
-bool RunBlurKernel(void* p_CmdQ, int p_Width, int p_Height, bool p_Wrap, float p_Amount, void* p_Previous, void* p_Next, float* p_Output);
+// Part of the output to fill, in buffer rows and columns: [x1, x2) x [y1, y2). Empty = all of it.
+struct KernelWindow
+{
+    int x1 = 0, y1 = 0, x2 = 0, y2 = 0;
+};
+
+// Reads the clip tag (ClipTag.h) from the source frame; returns the clip number or -1.
+int ReadClipTag(const StitchParams& p_Params, const FrameBuffer& p_Input);
+
+// Stitches, reframes or passes through p_Input into p_Output on the CPU (all cores). With
+// p_Params.fullRes the lenses are read from p_Lenses instead of p_Input, after checking that
+// they show the same frame. Both images are p_Params.width x p_Params.height.
+bool RunStitchKernel(const StitchParams& p_Params, const FrameBuffer& p_Input, const FrameOutput& p_Output,
+                     const LensImages* p_Lenses = nullptr, std::shared_ptr<FullResCheck> p_Check = nullptr,
+                     KernelWindow p_Window = KernelWindow());
+
+// Movement of the picture as x, y per pixel in fractions of the picture size (MotionBlur.h).
+struct FlowField
+{
+    std::vector<float> xy;
+    int width = 1;
+    int height = 1;
+};
+
+// Smears p_Output, in place, along the movement towards the previous and the next frame.
+// p_Wrap: the left and right edges meet, as in a 360 picture.
+bool RunBlurKernel(int p_Width, int p_Height, bool p_Wrap, float p_Amount, const FlowField& p_Previous, const FlowField& p_Next,
+                   const FrameOutput& p_Output);

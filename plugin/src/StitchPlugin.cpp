@@ -1,19 +1,17 @@
-// Insta360 Stitch: OpenFX plugin skeleton.
+// Insta360 Stitch: OpenFX plugin. Windows port: renders on the CPU (CpuKernel.cpp) where the
+// macOS original used Metal, and decodes the lens files with FFmpeg (LensDecoder.cpp).
 //
 // Takes the side-by-side dual-fisheye compound clip made by tools/ingest.py and turns it
 // into either an equirectangular 360 picture or a flat view through a virtual camera
 // (reframe). Resolve stretches the clip to the timeline frame, so the plugin works in
 // normalised coordinates and the output is always the size of the input. Frame geometry and calibration problems are recorded in
-// ~/Library/Logs/Insta360Stitch.log.
+// %APPDATA%\Insta360Stitch\Logs\Insta360Stitch.log.
 
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
 #include <atomic>
-#include <spawn.h>
-#include <sys/stat.h>
-#include <sys/wait.h>
 #include <chrono>
 #include <set>
 #include <vector>
@@ -32,13 +30,14 @@
 #include "ClipTag.h"
 #include "Motion.h"
 #include "MotionBlur.h"
+#include "Platform.h"
 #include "Registry.h"
 #include "Tracker.h"
 #include "Updater.h"
 
 #define kPluginName "Insta360 Stitch"
 #define kPluginGrouping "Insta360"
-#define kPluginDescription "Stitches and reframes Insta360 X5 360 footage. Free and open source; support it at " kDonateUrl
+#define kPluginDescription "Stitches and reframes Insta360 X5 360 footage (Windows port). Free and open source; support it at " kDonateUrl
 #define kPluginIdentifier "org.insta360resolve.Stitch"
 #define kPluginVersionMajor 0
 #define kPluginVersionMinor 1
@@ -114,9 +113,9 @@ static void LogOnce(const std::string& p_Message)
         return;
     }
 
-    const char* home = getenv("HOME");
-    const std::string path = std::string(home ? home : "/tmp") + "/Library/Logs/Insta360Stitch.log";
-    if (FILE* f = fopen(path.c_str(), "a"))
+    const std::string dir = LogDir();
+    MakeDirectories(dir);
+    if (FILE* f = OpenFile(JoinPath(dir, "Insta360Stitch.log"), "a"))
     {
         fprintf(f, "%s\n", p_Message.c_str());
         fclose(f);
@@ -125,46 +124,27 @@ static void LogOnce(const std::string& p_Message)
 
 ////////////////////////////////////////////////////////////////////////////////
 
-class StitchProcessor : public OFX::ImageProcessor
+// The host's image as the kernel sees it: RGBA float rows, row 0 at the bottom of the picture.
+static FrameBuffer InputOf(const OFX::Image& p_Image)
 {
-public:
-    explicit StitchProcessor(OFX::ImageEffect& p_Instance) : OFX::ImageProcessor(p_Instance), m_SrcImg(nullptr), m_Params() {}
-
-    void setSrcImg(OFX::Image* p_SrcImg) { m_SrcImg = p_SrcImg; }
-    void setParams(const StitchParams& p_Params) { m_Params = p_Params; }
-    void setLensImages(const LensImages* p_Lenses, std::shared_ptr<FullResCheck> p_Check)
-    {
-        m_Lenses = p_Lenses;
-        m_Check = p_Check;
-    }
-
-    void processImagesMetal() override;
-    void multiThreadProcessImages(OfxRectI p_ProcWindow) override;
-
-private:
-    OFX::Image* m_SrcImg;
-    StitchParams m_Params;
-    const LensImages* m_Lenses = nullptr;
-    std::shared_ptr<FullResCheck> m_Check;
-};
-
-void StitchProcessor::processImagesMetal()
-{
-    const float* input = static_cast<const float*>(m_SrcImg->getPixelData());
-    float* output = static_cast<float*>(_dstImg->getPixelData());
-
-    if (!RunStitchMetalKernel(_pMetalCmdQ, m_Params, input, output, m_Lenses, m_Check))
-    {
-        LogOnce("ERROR: Metal kernel failed to build; see Resolve's console output");
-        OFX::throwSuiteStatusException(kOfxStatFailed);
-    }
+    const OfxRectI b = p_Image.getBounds();
+    FrameBuffer view;
+    view.data = static_cast<const unsigned char*>(p_Image.getPixelData());
+    view.width = b.x2 - b.x1;
+    view.height = b.y2 - b.y1;
+    view.rowBytes = long(p_Image.getRowBytes());
+    return view;
 }
 
-// This plugin is Metal-only; there is no CPU implementation of the stitch.
-void StitchProcessor::multiThreadProcessImages(OfxRectI /*p_ProcWindow*/)
+static FrameOutput OutputOf(OFX::Image& p_Image)
 {
-    LogOnce("ERROR: host asked for CPU rendering; Insta360 Stitch needs Metal");
-    OFX::throwSuiteStatusException(kOfxStatErrUnsupported);
+    const OfxRectI b = p_Image.getBounds();
+    FrameOutput view;
+    view.data = static_cast<unsigned char*>(p_Image.getPixelData());
+    view.width = b.x2 - b.x1;
+    view.height = b.y2 - b.y1;
+    view.rowBytes = long(p_Image.getRowBytes());
+    return view;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -200,6 +180,8 @@ public:
 
     void render(const OFX::RenderArguments& p_Args) override;
     void changedParam(const OFX::InstanceChangedArgs& p_Args, const std::string& p_ParamName) override;
+    // The host asks for memory back: drop the decoded lens frames.
+    void purgeCaches() override { ReleaseLensDecoders(); }
 
 private:
     void applyStyle(int p_Style);
@@ -328,7 +310,7 @@ ClipFiles StitchPlugin::clipFiles()
         m_ClipFilesRead = true;
         if (!m_ClipFiles.found)
         {
-            LogOnce("ERROR: clip tag found but the clip is not registered on this Mac; import it here");
+            LogOnce("ERROR: clip tag found but the clip is not registered on this computer; import it here");
         }
     }
     return m_ClipFiles;
@@ -352,28 +334,29 @@ bool StitchPlugin::stabilization(double p_Time, double p_R[9])
     return true;
 }
 
-// ~/Library/Application Support/Insta360Stitch/default-calibration.json, written by tools/ingest.py.
+// %APPDATA%\Insta360Stitch\default-calibration.json, written by tools/ingest.py.
 // Read again only when the file changes, since this runs for every frame.
 static bool DefaultCalibration(std::string& p_Raw)
 {
     static std::mutex mutex;
     static std::string cached;
-    static struct timespec cachedTime = {0, 0};
+    static int64_t cachedTime = -1, cachedSize = -1;
 
-    const char* home = getenv("HOME");
-    const std::string path = std::string(home ? home : "") + "/Library/Application Support/Insta360Stitch/default-calibration.json";
-    struct stat info;
-    if (!home || stat(path.c_str(), &info) != 0)
+    const std::string support = SupportDir();
+    const std::string path = JoinPath(support, "default-calibration.json");
+    int64_t modified = 0, size = 0;
+    if (support.empty() || !FileStamp(path, modified, size))
     {
         return false;
     }
 
     std::lock_guard<std::mutex> lock(mutex);
-    if (info.st_mtimespec.tv_sec != cachedTime.tv_sec || info.st_mtimespec.tv_nsec != cachedTime.tv_nsec)
+    if (modified != cachedTime || size != cachedSize)
     {
         std::string raw;
         cached = ReadCalibrationFile(path, raw) ? raw : "";
-        cachedTime = info.st_mtimespec;
+        cachedTime = modified;
+        cachedSize = size;
     }
     if (cached.empty())
     {
@@ -781,7 +764,7 @@ void StitchPlugin::checkForUpdates()
     }
     if (release.pkgUrl.empty())
     {
-        sendMessage(OFX::Message::eMessageMessage, "", text + "\n\nOpening the release page.");
+        sendMessage(OFX::Message::eMessageMessage, "", text + "\n\nThat release has no Windows installer. Opening the release page.");
         OpenWithSystem(release.pageUrl);
         return;
     }
@@ -954,12 +937,11 @@ void StitchPlugin::render(const OFX::RenderArguments& p_Args)
     const OfxRectD rod = m_SrcClip->getRegionOfDefinition(p_Args.time);
     char line[512];
     snprintf(line, sizeof(line),
-             "render: src %dx%d  dst %dx%d  clip extent %.0fx%.0f  window %dx%d  scale %.3fx%.3f  %s",
+             "render: src %dx%d  dst %dx%d  clip extent %.0fx%.0f  window %dx%d  scale %.3fx%.3f  CPU",
              sb.x2 - sb.x1, sb.y2 - sb.y1, db.x2 - db.x1, db.y2 - db.y1,
              rod.x2 - rod.x1, rod.y2 - rod.y1,
              p_Args.renderWindow.x2 - p_Args.renderWindow.x1, p_Args.renderWindow.y2 - p_Args.renderWindow.y1,
-             p_Args.renderScale.x, p_Args.renderScale.y,
-             p_Args.isEnabledMetalRender ? "Metal" : "CPU");
+             p_Args.renderScale.x, p_Args.renderScale.y);
     LogOnce(line);
 
     if ((sb.x1 != db.x1) || (sb.x2 != db.x2) || (sb.y1 != db.y1) || (sb.y2 != db.y2))
@@ -967,6 +949,14 @@ void StitchPlugin::render(const OFX::RenderArguments& p_Args)
         LogOnce("ERROR: source and output frames differ in size; cannot stitch");
         OFX::throwSuiteStatusException(kOfxStatFailed);
     }
+
+    if (!src->getPixelData() || !dst->getPixelData())
+    {
+        LogOnce("ERROR: the host handed over images without pixels");
+        OFX::throwSuiteStatusException(kOfxStatFailed);
+    }
+    const FrameBuffer input = InputOf(*src);
+    const FrameOutput output = OutputOf(*dst);
 
     StitchParams params = {};
     params.width = sb.x2 - sb.x1;
@@ -977,13 +967,13 @@ void StitchPlugin::render(const OFX::RenderArguments& p_Args)
     m_View->getValueAtTime(p_Args.time, view);
     params.mode = kViewModes[view >= 0 && view < 4 ? view : 0];
 
-    // Which clip this is, from the tag the import put in its corners (read once, on the GPU).
+    // Which clip this is, from the tag the import put in its corners (read once).
     // Frames too small to read it from, like thumbnails, can use up the attempts before a real one
     // comes, so a clip taken to have no tag is still looked at now and then.
     const bool retryTag = clipId() < 0 && ++m_TagRetries % kTagRetryEvery == 0;
-    if ((clipId() == 0 || retryTag) && p_Args.isEnabledMetalRender && p_Args.pMetalCmdQ)
+    if (clipId() == 0 || retryTag)
     {
-        noteTag(ReadClipTagMetal(p_Args.pMetalCmdQ, params, static_cast<const float*>(src->getPixelData())));
+        noteTag(ReadClipTag(params, input));
     }
     // Where the view looks at a given time, which the neighbouring frames need too for motion blur.
     const auto aim = [&](double p_Time, StitchParams& p_Out)
@@ -1030,14 +1020,14 @@ void StitchPlugin::render(const OFX::RenderArguments& p_Args)
         LogOnce(check);
     }
     if ((params.mode == eModeStitch || params.mode == eModeReframe) && m_FullRes->getValueAtTime(p_Args.time) && !neverMatched &&
-        p_Args.isEnabledMetalRender && p_Args.pMetalCmdQ && clipId() > 0 && std::max(params.width, params.height) >= kFullResMinSize)
+        clipId() > 0 && std::max(params.width, params.height) >= kFullResMinSize)
     {
         const ClipFiles files = clipFiles();
         if (files.lensA.empty() || files.lensB.empty())
         {
             LogOnce("full resolution: the clip's lens files are not registered; using Resolve's picture");
         }
-        else if (!AcquireLensImages(p_Args.pMetalCmdQ, files.lensA, files.lensB, int(lround(p_Args.time)), lensImages))
+        else if (!AcquireLensImages(files.lensA, files.lensB, int(lround(p_Args.time)), lensImages))
         {
             LogOnce("ERROR: full resolution: cannot decode " + files.lensA + " / " + files.lensB + "; using Resolve's picture");
         }
@@ -1048,7 +1038,7 @@ void StitchPlugin::render(const OFX::RenderArguments& p_Args)
             params.lensHeight = lensImages.height;
             // The seam analysis is tuned to lenses about 1000 pixels across.
             params.seamLod = float(std::max(0.0, log2(lensImages.width / 960.0)));
-            params.yuvScale = lensImages.bits > 8 ? float(65535.0 / (1023.0 * 64.0)) : 1.0f; // 10-bit sits in the top of 16
+            params.yuvScale = 1.0f; // LensDecoder.cpp scales every bit depth to the full 16 bits
             params.chromaMid = lensImages.bits > 8 ? float(512.0 / 1023.0) : float(128.0 / 255.0);
             char sizes[128];
             snprintf(sizes, sizeof(sizes), "full resolution: lenses %dx%d %d-bit for a %dx%d frame",
@@ -1069,18 +1059,20 @@ void StitchPlugin::render(const OFX::RenderArguments& p_Args)
     }
     FillLensOffset(lenses, params);
 
-    StitchProcessor processor(*this);
-    processor.setDstImg(dst.get());
-    processor.setSrcImg(src.get());
-    processor.setParams(params);
-    processor.setLensImages(params.fullRes != 0 ? &lensImages : nullptr, m_FullResCheck);
-    processor.setGPURenderArgs(p_Args);
-    processor.setRenderWindow(p_Args.renderWindow);
-    processor.process();
+    // The render window in buffer rows and columns (the bounds may not start at 0).
+    KernelWindow window;
+    window.x1 = p_Args.renderWindow.x1 - db.x1;
+    window.x2 = p_Args.renderWindow.x2 - db.x1;
+    window.y1 = p_Args.renderWindow.y1 - db.y1;
+    window.y2 = p_Args.renderWindow.y2 - db.y1;
+    if (!RunStitchKernel(params, input, output, params.fullRes != 0 ? &lensImages : nullptr, m_FullResCheck, window))
+    {
+        LogOnce("ERROR: the stitch could not run on this frame");
+        OFX::throwSuiteStatusException(kOfxStatFailed);
+    }
 
     const double blur = m_MotionBlur->getValueAtTime(p_Args.time);
-    if (blur > 0.0 && (params.mode == eModeStitch || params.mode == eModeReframe) && !neverMatched &&
-        p_Args.isEnabledMetalRender && p_Args.pMetalCmdQ && clipId() > 0)
+    if (blur > 0.0 && (params.mode == eModeStitch || params.mode == eModeReframe) && !neverMatched && clipId() > 0)
     {
         const ClipFiles files = clipFiles();
         StitchParams frames[3];
@@ -1092,7 +1084,7 @@ void StitchPlugin::render(const OFX::RenderArguments& p_Args)
         {
             const double time = p_Args.time + i - 1;
             have[i] = !files.lensA.empty() && !files.lensB.empty() && time >= 0.0 &&
-                      AcquireLensImages(p_Args.pMetalCmdQ, files.lensA, files.lensB, int(lround(time)), images[i]);
+                      AcquireLensImages(files.lensA, files.lensB, int(lround(time)), images[i]);
             if (have[i])
             {
                 frames[i] = params;
@@ -1103,14 +1095,13 @@ void StitchPlugin::render(const OFX::RenderArguments& p_Args)
                 frames[i].lensWidth = images[i].width;
                 frames[i].lensHeight = images[i].height;
                 frames[i].seamLod = float(std::max(0.0, log2(images[i].width / 960.0)));
-                frames[i].yuvScale = images[i].bits > 8 ? float(65535.0 / (1023.0 * 64.0)) : 1.0f;
+                frames[i].yuvScale = 1.0f;
                 frames[i].chromaMid = images[i].bits > 8 ? float(512.0 / 1023.0) : float(128.0 / 255.0);
                 FillLensParams(lenses, 2 * images[i].width, images[i].height, frames[i].lens);
                 aim(time, frames[i]);
             }
         }
-        if (!RunMotionBlur(p_Args.pMetalCmdQ, params.width, params.height, params.mode == eModeStitch, float(blur / 100.0), frames, images, have,
-                           static_cast<const float*>(src->getPixelData()), static_cast<float*>(dst->getPixelData())))
+        if (!RunMotionBlur(params.width, params.height, params.mode == eModeStitch, float(blur / 100.0), frames, images, have, input, output))
         {
             LogOnce("motion blur: skipped, the neighbouring frames could not be read from the lens files");
         }
@@ -1446,10 +1437,10 @@ void StitchPluginFactory::describe(OFX::ImageEffectDescriptor& p_Desc)
     p_Desc.setRenderTwiceAlways(false);
     p_Desc.setSupportsMultipleClipPARs(false);
 
-    p_Desc.setSupportsMetalRender(true);
-
+    // Rendered on the CPU, on all cores: Resolve hands over images in memory whatever GPU it uses.
     // The stitch moves pixels, so the host must not treat this as a per-pixel colour operation.
-    p_Desc.setNoSpatialAwareness(false);
+    // (Resolve's extension property; the public OpenFX support library has no setter for it.)
+    p_Desc.getPropertySet().propSetString("OfxImageEffectPropNoSpatialAwareness", "false", 0, false);
 
     p_Desc.setOverlayInteractDescriptor(new ReframeInteractDescriptor());
 
@@ -1487,7 +1478,7 @@ void StitchPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, 
     fullRes->setLabels("Full Resolution", "Full Resolution", "Full Resolution");
     fullRes->setHint("Reads the lenses from the clip's own files at the full recorded resolution, as sharp as Insta360 Studio, "
                      "instead of from Resolve, which only passes on as many pixels as the timeline has. Turn off if playback "
-                     "is too slow on this Mac. Grades applied before this effect do not reach the full resolution picture.");
+                     "is too slow on this computer. Grades applied before this effect do not reach the full resolution picture.");
     fullRes->setDefault(true);
     fullRes->setAnimates(false);
     page->addChild(*fullRes);
@@ -1725,7 +1716,7 @@ void StitchPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, 
     OFX::StringParamDescriptor* aboutText = p_Desc.defineStringParam(kParamAbout);
     aboutText->setLabels("Insta360 Stitch", "Insta360 Stitch", "Insta360 Stitch");
     aboutText->setStringType(OFX::eStringTypeLabel);
-    aboutText->setDefault("Version " PLUGIN_VERSION ", free and open source");
+    aboutText->setDefault("Version " PLUGIN_VERSION " for Windows, free and open source");
     aboutText->setAnimates(false);
     aboutText->setParent(*about);
     page->addChild(*aboutText);

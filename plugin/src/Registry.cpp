@@ -1,4 +1,5 @@
 #include "Registry.h"
+#include "Platform.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -16,9 +17,16 @@ static void AppendUtf8(std::string& p_Out, unsigned p_Code)
         p_Out += char(0xC0 | (p_Code >> 6));
         p_Out += char(0x80 | (p_Code & 0x3F));
     }
-    else
+    else if (p_Code < 0x10000)
     {
         p_Out += char(0xE0 | (p_Code >> 12));
+        p_Out += char(0x80 | ((p_Code >> 6) & 0x3F));
+        p_Out += char(0x80 | (p_Code & 0x3F));
+    }
+    else
+    {
+        p_Out += char(0xF0 | (p_Code >> 18));
+        p_Out += char(0x80 | ((p_Code >> 12) & 0x3F));
         p_Out += char(0x80 | ((p_Code >> 6) & 0x3F));
         p_Out += char(0x80 | (p_Code & 0x3F));
     }
@@ -26,14 +34,11 @@ static void AppendUtf8(std::string& p_Out, unsigned p_Code)
 
 std::string JsonString(const std::string& p_Path, const std::string& p_Key)
 {
-    std::ifstream file(p_Path);
-    if (!file)
+    std::string text;
+    if (!ReadWholeFile(p_Path, text))
     {
         return "";
     }
-    std::stringstream buffer;
-    buffer << file.rdbuf();
-    const std::string text = buffer.str();
 
     size_t pos = text.find("\"" + p_Key + "\"");
     if (pos == std::string::npos || (pos = text.find(':', pos)) == std::string::npos ||
@@ -53,8 +58,19 @@ std::string JsonString(const std::string& p_Path, const std::string& p_Key)
         const char c = text[++i];
         if (c == 'u' && i + 4 < text.size())
         {
-            AppendUtf8(out, unsigned(strtoul(text.substr(i + 1, 4).c_str(), nullptr, 16)));
+            unsigned code = unsigned(strtoul(text.substr(i + 1, 4).c_str(), nullptr, 16));
             i += 4;
+            // Characters beyond the first 65536 come as a pair of escapes (Python's json does this).
+            if (code >= 0xD800 && code < 0xDC00 && i + 6 < text.size() && text[i + 1] == '\\' && text[i + 2] == 'u')
+            {
+                const unsigned low = unsigned(strtoul(text.substr(i + 3, 4).c_str(), nullptr, 16));
+                if (low >= 0xDC00 && low < 0xE000)
+                {
+                    code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
+                    i += 6;
+                }
+            }
+            AppendUtf8(out, code);
         }
         else
         {
@@ -67,14 +83,14 @@ std::string JsonString(const std::string& p_Path, const std::string& p_Key)
 ClipFiles LookupClip(int p_ClipId)
 {
     ClipFiles files;
-    const char* home = getenv("HOME");
-    if (!home || p_ClipId <= 0)
+    const std::string support = SupportDir();
+    if (support.empty() || p_ClipId <= 0)
     {
         return files;
     }
     char name[16];
     snprintf(name, sizeof(name), "%06x", p_ClipId);
-    const std::string path = std::string(home) + "/Library/Application Support/Insta360Stitch/clips/" + name + ".json";
+    const std::string path = JoinPath(JoinPath(support, "clips"), std::string(name) + ".json");
     files.info = JsonString(path, "info");
     files.motion = JsonString(path, "motion");
     files.lensA = JsonString(path, "lens_a");

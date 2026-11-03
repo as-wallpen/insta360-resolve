@@ -6,7 +6,6 @@
 // example straight from ffmpeg), and prints the fit for lens B as one line of JSON:
 //   SeamRefine calibration_raw frameCount < frames.rgb
 // The calibration string should be the factory one; the fit is relative to it.
-#include <dispatch/dispatch.h>
 
 #include <algorithm>
 #include <cmath>
@@ -15,6 +14,12 @@
 #include <vector>
 
 #include "Calibration.h"
+#include "Parallel.h"
+
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
 
 // Same constants as refine_seam.py.
 static const int kWorkSize = 1920;          // lens images are analysed at this size
@@ -155,10 +160,10 @@ static void MeasureFrame(const unsigned char* p_A, const unsigned char* p_B, con
 
     // cost[(i * kAlongSteps + j) * kBins + bin]; each candidate distance runs on its own core.
     std::vector<double> cost(size_t(kInvDistances) * kAlongSteps * kBins);
-    double* costOut = cost.data(); // blocks capture C++ objects as const copies
+    double* costOut = cost.data();
     const Vec3* rayIn = rays.data();
     const size_t rayCount = rays.size();
-    dispatch_apply(kInvDistances, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t p_I) {
+    ParallelFor(kInvDistances, 1, [&](int p_I) {
         const double q = InvDistance(int(p_I));
         std::vector<float> lumaA(rayCount);
         std::vector<char> validA(rayCount);
@@ -418,6 +423,9 @@ int main(int argc, char** argv)
         return 2;
     }
 
+#ifdef _WIN32
+    _setmode(_fileno(stdin), _O_BINARY); // the frames are raw bytes, not text
+#endif
     const size_t frameBytes = size_t(kWorkSize) * kWorkSize * 3;
     std::vector<unsigned char> a(frameBytes), b(frameBytes);
     std::vector<double> qBest(size_t(frames) * kBins), alongBest(size_t(frames) * kBins);

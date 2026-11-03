@@ -3,7 +3,7 @@
 #include <string>
 
 // What the import registered for a clip number (tools/ingest.py register_clip), from
-// ~/Library/Application Support/Insta360Stitch/clips/<number in hex>.json.
+// %APPDATA%\\Insta360Stitch\\clips\\<number in hex>.json (SupportDir() in Platform.h).
 struct ClipFiles
 {
     bool found = false;

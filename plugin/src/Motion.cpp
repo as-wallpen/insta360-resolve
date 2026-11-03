@@ -1,11 +1,13 @@
 #include "Motion.h"
+#include "Platform.h"
 
 #include <cmath>
 #include <cstring>
 #include <fstream>
 #include <map>
 #include <mutex>
-#include <sys/stat.h>
+#include <algorithm>
+#include <cstdint>
 
 namespace
 {
@@ -70,33 +72,43 @@ std::shared_ptr<const MotionData> MotionData::Load(const std::string& p_Path)
     static std::mutex mutex;
     struct Entry
     {
-        time_t modified;
-        off_t size;
+        int64_t modified;
+        int64_t size;
         std::shared_ptr<const MotionData> data;
     };
     static std::map<std::string, Entry> cache;
 
     // Importing a clip again rewrites its file while Resolve is open, so check that it is the same one.
-    struct stat info = {};
-    const bool exists = stat(p_Path.c_str(), &info) == 0;
+    int64_t modified = 0, size = 0;
+    const bool exists = FileStamp(p_Path, modified, size);
 
     std::lock_guard<std::mutex> lock(mutex);
     const auto it = cache.find(p_Path);
-    if (it != cache.end() && exists && it->second.modified == info.st_mtime && it->second.size == info.st_size)
+    if (it != cache.end() && exists && it->second.modified == modified && it->second.size == size)
     {
         return it->second.data;
     }
 
     std::shared_ptr<MotionData> data;
-    std::ifstream file(p_Path, std::ios::binary);
+    std::string bytes;
+    size_t at = 0;
+    const auto read = [&](void* p_To, size_t p_Count) {
+        if (at + p_Count > bytes.size())
+        {
+            return false;
+        }
+        memcpy(p_To, bytes.data() + at, p_Count);
+        at += p_Count;
+        return true;
+    };
     char magic[8];
     uint32_t count = 0;
     float fps = 0.0f;
-    if (file.read(magic, 8) && memcmp(magic, "I360MOT1", 8) == 0 && file.read(reinterpret_cast<char*>(&count), 4) &&
-        file.read(reinterpret_cast<char*>(&fps), 4) && count > 0 && count < 10000000)
+    if (ReadWholeFile(p_Path, bytes) && read(magic, 8) && memcmp(magic, "I360MOT1", 8) == 0 && read(&count, 4) && read(&fps, 4) &&
+        count > 0 && count < 10000000)
     {
         std::vector<float> values(size_t(count) * 7);
-        if (file.read(reinterpret_cast<char*>(values.data()), std::streamsize(values.size() * sizeof(float))))
+        if (read(values.data(), values.size() * sizeof(float)))
         {
             data = std::make_shared<MotionData>();
             data->m_Fps = fps > 0.0f ? fps : 30.0;
@@ -108,13 +120,13 @@ std::shared_ptr<const MotionData> MotionData::Load(const std::string& p_Path)
                 memcpy(&data->m_Up[i * 3], &values[i * 7 + 4], 3 * sizeof(float));
             }
             float speed = 0.0f; // after the frames, in files from sped-up clips
-            if (file.read(reinterpret_cast<char*>(&speed), 4) && speed > 1.0f)
+            if (read(&speed, 4) && speed > 1.0f)
             {
                 data->m_Speed = speed;
             }
         }
     }
-    cache[p_Path] = Entry{info.st_mtime, info.st_size, data};
+    cache[p_Path] = Entry{modified, size, data};
     return data;
 }
 

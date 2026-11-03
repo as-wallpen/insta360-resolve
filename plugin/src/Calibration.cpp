@@ -1,4 +1,5 @@
 #include "Calibration.h"
+#include "Platform.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -69,14 +70,11 @@ bool ParseCalibration(const std::string& p_Raw, LensCalibration p_Lenses[2])
 
 bool ReadCalibrationFile(const std::string& p_Path, std::string& p_Raw)
 {
-    std::ifstream file(p_Path);
-    if (!file)
+    std::string text;
+    if (!ReadWholeFile(p_Path, text))
     {
         return false;
     }
-    std::stringstream buffer;
-    buffer << file.rdbuf();
-    const std::string text = buffer.str();
 
     const std::string key = "\"calibration_raw\"";
     size_t pos = text.find(key);

@@ -1,0 +1,116 @@
+# Insta360 Stitch OpenFX plugin for Windows (x64): CPU rendering, FFmpeg lens decoding.
+#
+# Cross-compiled with MinGW-w64 (Linux, or MSYS2 on Windows):
+#   make -f Makefile.win                     # build-win/Insta360Stitch.ofx.bundle
+#   make -f Makefile.win PLATFORM=native     # build-native/..., a Linux build of the same code, for the tests
+#   make -f Makefile.win PLATFORM=native test
+#
+# FFMPEG points at a static FFmpeg for the target (tools/build_ffmpeg_windows.sh makes one for
+# Windows); the native build uses the system's FFmpeg through pkg-config. The OpenFX headers and
+# support library are in third_party (with the draw suite added; see third_party/README.md).
+
+PLATFORM ?= windows
+NAME     = Insta360Stitch
+VERSION := $(shell sed -n '/CFBundleShortVersionString/{n;s/.*<string>\(.*\)<\/string>.*/\1/p;}' Info.plist)
+OFX_INC  = -Ithird_party/openfx-include -Ithird_party/openfx-support/include -Ithird_party/openfx-support/Library
+COMMON   = -std=gnu++17 -O2 -fno-math-errno -D_USE_MATH_DEFINES -DPLUGIN_VERSION='"$(VERSION)"' $(OFX_INC) -Isrc -Wall -Wno-unused-parameter \
+           -Wno-sign-compare -Wno-unused-variable -Wno-unused-but-set-variable -Wno-deprecated-declarations -Wno-misleading-indentation
+
+ifeq ($(PLATFORM),windows)
+CROSS   ?= x86_64-w64-mingw32-
+CXX      = $(CROSS)g++
+STRIP    = $(CROSS)strip
+FFMPEG  ?= ../../deps/ffwin
+BUILD    = build-win
+EXE      = .exe
+ARCHDIR  = Win64
+CXXFLAGS = $(COMMON) -march=x86-64-v2 -mtune=generic -I$(FFMPEG)/include -DNOMINMAX -D_WIN32_WINNT=0x0A00
+FFLIBS   = -L$(FFMPEG)/lib -lavformat -lavcodec -lavutil -lz -lbcrypt
+# Everything static: the plugin needs no DLLs besides Windows' own.
+LDDLL    = -shared -static -static-libgcc -static-libstdc++ -Wl,--no-insert-timestamp
+LDEXE    = -static -static-libgcc -static-libstdc++
+SYSLIBS  = -lwinhttp -lshell32 -lole32 -luuid -luser32 -ladvapi32 -lgdi32
+else
+CXX     ?= g++
+STRIP    = strip
+BUILD    = build-native
+EXE      =
+ARCHDIR  = Linux-x86-64
+CXXFLAGS = $(COMMON) -fPIC -fvisibility=hidden $(shell pkg-config --cflags libavformat libavcodec libavutil)
+FFLIBS   = $(shell pkg-config --libs libavformat libavcodec libavutil)
+LDDLL    = -shared -fvisibility=hidden
+LDEXE    =
+SYSLIBS  = -lpthread -ldl
+endif
+
+BUNDLE   = $(BUILD)/$(NAME).ofx.bundle
+PLUGIN   = $(BUNDLE)/Contents/$(ARCHDIR)/$(NAME).ofx
+RES      = $(BUNDLE)/Contents/Resources
+
+SUPPORT  = ofxsCore ofxsImageEffect ofxsInteract ofxsLog ofxsMultiThread ofxsParams ofxsProperty ofxsPropertyValidation
+CORE     = Calibration Tracker Registry Motion Platform CpuKernel LensDecoder MotionBlur ProgressWindow Updater
+OBJS     = $(BUILD)/StitchPlugin.o $(CORE:%=$(BUILD)/%.o) $(SUPPORT:%=$(BUILD)/%.o)
+HEADERS  = $(wildcard src/*.h)
+
+ifeq ($(PLATFORM),windows)
+HELPERS  = $(RES)/TrackProgress.exe $(RES)/SeamRefine.exe
+else
+HELPERS  = $(RES)/SeamRefine
+endif
+
+all: $(PLUGIN) $(HELPERS) $(RES)/org.insta360resolve.Stitch.png $(RES)/org.insta360resolve.Stitch.svg
+
+$(PLUGIN): $(OBJS)
+	mkdir -p $(dir $@)
+	$(CXX) $(OBJS) -o $@ $(LDDLL) $(FFLIBS) $(SYSLIBS)
+
+$(BUILD)/%.o: src/%.cpp $(HEADERS) Info.plist | $(BUILD)
+	$(CXX) -c $< -o $@ $(CXXFLAGS)
+
+$(BUILD)/ofxs%.o: third_party/openfx-support/Library/ofxs%.cpp | $(BUILD)
+	$(CXX) -c $< -o $@ $(CXXFLAGS) -Ithird_party/openfx-support/Library -w
+
+# Progress window shown while tracking and importing; a separate program because Resolve is busy meanwhile.
+$(RES)/TrackProgress.exe: src/ProgressHelper_win.cpp
+	mkdir -p $(dir $@)
+	$(CXX) $< -o $@ -std=gnu++17 -O2 -municode -mwindows $(LDEXE) -lcomctl32 -lshell32 -lgdi32
+
+# Fits the seam calibration correction for tools/ingest.py, which must not need numpy or OpenCV.
+$(RES)/SeamRefine$(EXE): src/SeamRefine.cpp $(BUILD)/Calibration.o $(BUILD)/Platform.o src/Calibration.h
+	mkdir -p $(dir $@)
+	$(CXX) src/SeamRefine.cpp $(BUILD)/Calibration.o $(BUILD)/Platform.o -o $@ $(CXXFLAGS) $(LDEXE) $(SYSLIBS)
+
+$(RES)/org.insta360resolve.Stitch.png: resources/icon.png
+	mkdir -p $(dir $@)
+	cp $< $@
+
+$(RES)/org.insta360resolve.Stitch.svg: resources/icon.svg
+	mkdir -p $(dir $@)
+	cp $< $@
+
+$(BUILD):
+	mkdir -p $(BUILD)
+
+TEST_OBJS = $(BUILD)/CpuKernel.o $(BUILD)/Calibration.o $(BUILD)/Tracker.o $(BUILD)/LensDecoder.o $(BUILD)/MotionBlur.o $(BUILD)/Motion.o $(BUILD)/Platform.o
+
+ifeq ($(PLATFORM),windows)
+TEST_LIBS = -L$(FFMPEG)/lib -lavformat -lavcodec -lswscale -lavutil -lz -lbcrypt
+else
+TEST_LIBS = $(shell pkg-config --libs libavformat libavcodec libswscale libavutil)
+endif
+
+$(BUILD)/test_plugin$(EXE): test/test_plugin.cpp $(TEST_OBJS) $(HEADERS)
+	$(CXX) test/test_plugin.cpp $(TEST_OBJS) -o $@ $(CXXFLAGS) $(LDEXE) $(TEST_LIBS) $(SYSLIBS)
+
+# Loads the built plugin the way a host would, and runs the kernel on test images.
+test: all $(BUILD)/test_plugin$(EXE)
+	$(BUILD)/test_plugin$(EXE) $(PLUGIN)
+	$(BUILD)/test_plugin$(EXE) --flow
+
+strip: all
+	$(STRIP) $(PLUGIN) $(HELPERS)
+
+clean:
+	rm -rf $(BUILD)
+
+.PHONY: all test strip clean

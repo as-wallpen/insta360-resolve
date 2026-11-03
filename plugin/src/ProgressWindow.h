@@ -1,7 +1,6 @@
 #pragma once
 
 #include <string>
-#include <sys/types.h>
 
 // Shows a progress window outside Resolve (the TrackProgress helper in the bundle) while the
 // plugin is busy, since Resolve's own interface does not update until the plugin returns.
@@ -19,9 +18,19 @@ public:
     void close();
 
 private:
-    pid_t m_Pid = -1;
+#ifdef _WIN32
+    void* m_Process = nullptr;    // HANDLE of the helper
+    void* m_ToHelper = nullptr;   // HANDLE, our end of its stdin
+    void* m_FromHelper = nullptr; // HANDLE, our end of its stdout
+#else
+    int m_Pid = -1;
     int m_ToHelper = -1;
     int m_FromHelper = -1;
+#endif
     bool m_Cancelled = false;
     double m_LastSent = -1.0;
 };
+
+// Where the bundle's helper programs are: <bundle>/Contents/Resources, next to the folder of
+// the plugin binary. p_Name without ".exe"; it is added on Windows.
+std::string BundleTool(const std::string& p_Name);
