@@ -20,6 +20,7 @@ Windows: the Scripts-menu entry passes the chosen clips in a UTF-8 file (--list)
 Lua cannot hand file names outside the ANSI code page on a command line.
 """
 import argparse
+import errno
 import json
 import os
 import random
@@ -267,7 +268,11 @@ def make_tag_movie(info, base):
     except OSError:
         done = None
     png.unlink(missing_ok=True)
-    return str(movie) if done is not None and done.returncode == 0 else ""
+    if done is not None and done.returncode == 0:
+        return str(movie)
+    # Imported again while Resolve still has the old movie open (Windows will not overwrite it):
+    # the clip keeps its number, so the old movie is still right.
+    return str(movie) if movie.exists() else ""
 
 
 def register_clip(info_path, lens_files, motion_path, clip_id=-1):
@@ -371,8 +376,13 @@ def measure_seam(lens_a, lens_b, factory_raw, frames=REFINE_FRAMES, helper=None,
             for k, data in enumerate(pool.map(lambda p: read_frame(*p), paths)):
                 proc.stdin.write(data)
                 report(k / len(paths))
-    except BrokenPipeError:
-        pass
+    except OSError as e:
+        # The helper stopped reading (it failed): its own message on stderr says why. Windows
+        # reports the closed pipe as EINVAL rather than as a broken pipe.
+        if not isinstance(e, BrokenPipeError) and e.errno != errno.EINVAL:
+            proc.kill()
+            proc.wait()
+            raise
     except BaseException:
         proc.kill()
         proc.wait()

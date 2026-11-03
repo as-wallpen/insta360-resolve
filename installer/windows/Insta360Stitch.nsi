@@ -7,7 +7,7 @@
 ;                                                                    the Workspace > Scripts entry
 ; and an uninstaller, listed under Settings > Apps.
 
-Unicode true
+Target amd64-unicode ; a 64-bit installer, like DaVinci Resolve
 !include "MUI2.nsh"
 !include "x64.nsh"
 

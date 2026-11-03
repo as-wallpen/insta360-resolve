@@ -17,6 +17,12 @@ local BIN_NAME = "Insta360"
 local SOURCE_BIN_NAME = "Source files"   -- inside BIN_NAME: the lens files the 360 clips are made from
 local WINDOWS = package.config:sub(1, 1) == "\\"
 local TEMP = WINDOWS and (os.getenv("TEMP") or os.getenv("TMP") or "C:\\Windows\\Temp") or "/tmp"
+if WINDOWS and (TEMP:find("[^%w%s%p]") or TEMP:find("?", 1, true)) then
+    -- A user folder with characters beyond ASCII ("Jürgen", "Łukasz"): Lua sees it only in the ANSI
+    -- code page, PowerShell scripts are UTF-8. Work in a plain folder all users may create instead.
+    TEMP = (os.getenv("ProgramData") or "C:\\ProgramData") .. "\\Insta360Stitch-temp"
+    os.execute('mkdir "' .. TEMP .. '" 2>nul')
+end
 local RUN_ID = tostring(os.time()) .. "-" .. tostring(math.random(100000, 999999))
 
 local PYTHONS
@@ -73,30 +79,55 @@ local function writeFile(path, text)
     return true
 end
 
--- A PowerShell script in TEMP (as UTF-8 with a byte order mark, which Windows PowerShell 5 needs
--- to read anything outside ASCII), run without a console window, then removed.
-local function powershell(name, lines)
-    local script = TEMP .. "\\insta360-" .. name .. "-" .. RUN_ID .. ".ps1"
-    if not writeFile(script, "\239\187\191" .. table.concat(lines, "\r\n") .. "\r\n") then
-        return false
+-- Base64 of a string, for PowerShell's -EncodedCommand.
+local function base64(data)
+    local alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    local out = {}
+    for i = 1, #data, 3 do
+        local a, b, c = data:byte(i, i + 2)
+        local n = a * 65536 + (b or 0) * 256 + (c or 0)
+        local chars = {}
+        for k = 3, 0, -1 do
+            local index = math.floor(n / 64 ^ k) % 64
+            table.insert(chars, alphabet:sub(index + 1, index + 1))
+        end
+        if not b then
+            chars[3], chars[4] = "=", "="
+        elseif not c then
+            chars[4] = "="
+        end
+        table.insert(out, table.concat(chars))
     end
-    run("powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File " .. quote(script))
-    os.remove(script)
-    return true
+    return table.concat(out)
+end
+
+-- Runs PowerShell commands without a console window (-WindowStyle Hidden also hides the console
+-- of the cmd.exe that os.execute starts). Passed as -EncodedCommand rather than a script file,
+-- which a group policy on script execution would refuse. The commands must be plain ASCII
+-- (anything else comes from files or environment variables); -EncodedCommand wants UTF-16.
+local function powershell(lines)
+    local text = table.concat(lines, "\n")
+    local utf16 = text:gsub(".", function(c) return c .. "\0" end)
+    return run("powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand " .. base64(utf16))
+end
+
+-- A Lua string as a PowerShell single-quoted string.
+local function psString(s)
+    return "'" .. s:gsub("'", "''") .. "'"
 end
 
 local function dialog(text)
     if WINDOWS then
         -- The text goes through a file: it can hold any character, and PowerShell reads it as UTF-8.
-        local name = "insta360-message-" .. RUN_ID .. ".txt"
-        writeFile(TEMP .. "\\" .. name, text)
-        powershell("message", {
+        local path = TEMP .. "\\insta360-message-" .. RUN_ID .. ".txt"
+        writeFile(path, text)
+        powershell({
             "Add-Type -AssemblyName System.Windows.Forms",
             "$owner = New-Object System.Windows.Forms.Form -Property @{TopMost = $true; ShowInTaskbar = $false}",
-            "$text = [IO.File]::ReadAllText((Join-Path $env:TEMP '" .. name .. "'), [Text.Encoding]::UTF8)",
+            "$text = [IO.File]::ReadAllText(" .. psString(path) .. ", [Text.Encoding]::UTF8)",
             "[void][System.Windows.Forms.MessageBox]::Show($owner, $text, 'Insta360 Import')",
         })
-        os.remove(TEMP .. "\\" .. name)
+        os.remove(path)
         return
     end
     run("osascript -e " .. quote('display dialog "' .. text:gsub("\\", "\\\\"):gsub('"', '\\"')
@@ -110,7 +141,7 @@ local list = os.getenv("INSTA360_FILES")
 if list then
     writeFile(listFile, list)
 elseif WINDOWS then
-    powershell("choose", {
+    powershell({
         "Add-Type -AssemblyName System.Windows.Forms",
         "$owner = New-Object System.Windows.Forms.Form -Property @{TopMost = $true; ShowInTaskbar = $false}",
         "$d = New-Object System.Windows.Forms.OpenFileDialog",
@@ -118,7 +149,7 @@ elseif WINDOWS then
         "$d.Filter = 'Insta360 clips (*.insv)|*.insv|All files (*.*)|*.*'",
         "$d.Multiselect = $true",
         "if ($d.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) {",
-        "    [IO.File]::WriteAllLines((Join-Path $env:TEMP 'insta360-clips-" .. RUN_ID .. ".txt'), $d.FileNames, (New-Object System.Text.UTF8Encoding $false))",
+        "    [IO.File]::WriteAllLines(" .. psString(listFile) .. ", $d.FileNames, (New-Object System.Text.UTF8Encoding $false))",
         "}",
     })
     local f = io.open(listFile, "rb")
@@ -182,8 +213,12 @@ end
 local report = TEMP .. (WINDOWS and "\\" or "/") .. "insta360-report-" .. RUN_ID .. ".tsv"
 local arguments = quote(INGEST) .. " --no-resolve --progress --report " .. quote(report) .. " --list " .. quote(listFile)
 if WINDOWS then
-    -- Its console window stays minimised; the progress window shows what is going on.
-    run('start "" /min /wait ' .. quote(python) .. " " .. arguments)
+    -- Without a console window (closing one would cut the import short); the progress window
+    -- shows what is going on.
+    powershell({
+        "$p = Start-Process -FilePath " .. psString(python) .. " -ArgumentList " .. psString(arguments)
+            .. " -WindowStyle Hidden -Wait -PassThru",
+    })
 else
     run(quote(python) .. " " .. arguments .. " >/dev/null 2>&1")
 end
@@ -271,6 +306,8 @@ end
 -- Diagnostics for layouts Resolve did not accept, in a file the user can send.
 local LOG = WINDOWS and ((os.getenv("APPDATA") or TEMP) .. "\\Insta360Stitch\\Insta360Import.log")
     or ((os.getenv("HOME") or "/tmp") .. "/Library/Logs/Insta360Import.log")
+-- How to name it in a dialog (on Windows the real path is in the ANSI code page, the dialog UTF-8).
+local LOG_NAME = WINDOWS and "%APPDATA%\\Insta360Stitch\\Insta360Import.log" or LOG
 local function log(text)
     local f = io.open(LOG, "a")
     if f then
@@ -364,7 +401,7 @@ local function build(clip)
     -- only needs it to be 2:1, and the lens shift is worked out from the size it really has.
     if not gotW or not gotH or gotW <= 0 or math.abs(gotW - 2 * gotH) > 2 then
         return string.format("FAILED: Resolve would not make a 2:1 timeline for the lenses (asked %dx%d, got %sx%s). "
-            .. "Please send " .. LOG, width, height, tostring(gotW), tostring(gotH))
+            .. "Please send " .. LOG_NAME, width, height, tostring(gotW), tostring(gotH))
     end
     width, height = gotW, gotH
 
@@ -381,7 +418,7 @@ local function build(clip)
     for _, placed in ipairs({{itemA, -1}, {itemB, 1}}) do
         local ok, problem = placeLens(placed[1], placed[2], width)
         if not ok then
-            return "FAILED: Resolve did not accept the lens layout (" .. problem .. "). Please send " .. LOG
+            return "FAILED: Resolve did not accept the lens layout (" .. problem .. "). Please send " .. LOG_NAME
         end
     end
     local tagItems, tagMedia = addTagTrack(timeline, clip.tag, start)

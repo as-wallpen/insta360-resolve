@@ -181,17 +181,29 @@ std::shared_ptr<DecodedLens> Convert(const AVFrame* p_Frame)
     return lens;
 }
 
+// Set by the hardware decoder's format choice; read by the reader that opened it.
+struct HardwareChoice
+{
+    AVPixelFormat format = AV_PIX_FMT_NONE;
+    bool failed = false; // the GPU turned the stream down and FFmpeg decodes it in software
+};
+
 enum AVPixelFormat PickHardwareFormat(AVCodecContext* p_Context, const enum AVPixelFormat* p_Formats)
 {
-    const AVPixelFormat wanted = AVPixelFormat(reinterpret_cast<intptr_t>(p_Context->opaque));
+    HardwareChoice* choice = static_cast<HardwareChoice*>(p_Context->opaque);
     for (const enum AVPixelFormat* f = p_Formats; *f != AV_PIX_FMT_NONE; ++f)
     {
-        if (*f == wanted)
+        if (choice && *f == choice->format)
         {
             return *f;
         }
     }
-    // The GPU cannot decode this stream: FFmpeg's software decoder takes over.
+    // The GPU cannot decode this stream: FFmpeg's software decoder takes over, for now on one
+    // thread; the reader notices and opens a multithreaded software decoder next time.
+    if (choice)
+    {
+        choice->failed = true;
+    }
     for (const enum AVPixelFormat* f = p_Formats; *f != AV_PIX_FMT_NONE; ++f)
     {
         const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get(*f);
@@ -235,7 +247,14 @@ public:
             }
             if (result == kRead)
             {
-                return keptFrame(p_Frame);
+                std::shared_ptr<DecodedLens> frame = keptFrame(p_Frame);
+                if (m_Hardware && m_Choice.failed)
+                {
+                    // The GPU declined this file: from the next frame on, software on all cores.
+                    m_UseHardware = false;
+                    close();
+                }
+                return frame;
             }
             if (result == kEnd)
             {
@@ -316,7 +335,9 @@ private:
                 if (hwFormat != AV_PIX_FMT_NONE && av_hwdevice_ctx_create(&device, type, nullptr, nullptr, 0) == 0)
                 {
                     m_Codec->hw_device_ctx = device;
-                    m_Codec->opaque = reinterpret_cast<void*>(intptr_t(hwFormat));
+                    m_Choice = HardwareChoice();
+                    m_Choice.format = hwFormat;
+                    m_Codec->opaque = &m_Choice;
                     m_Codec->get_format = PickHardwareFormat;
                     m_Hardware = true;
                     break;
@@ -488,6 +509,7 @@ private:
     bool m_Ended = false;
     bool m_UseHardware = true; // cleared for good when the GPU decoder failed on this file
     bool m_Hardware = false;   // the open decoder runs on the GPU
+    HardwareChoice m_Choice;
     std::deque<std::pair<int, std::shared_ptr<DecodedLens>>> m_Kept;
     double m_LastUsed = 0.0;
 };
