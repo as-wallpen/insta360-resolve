@@ -26,6 +26,8 @@ Differences from the macOS version
   (Direct3D 11) where available, otherwise in software.
 - Motion Blur measures movement with its own optical flow (Lucas-Kanade)
   instead of Apple's Vision framework.
+- Auto Stitch Distance also lines up seams closer than 0.4 m (down to
+  0.25 m), for a camera set down in grass or held close to things.
 
 Files
 -----

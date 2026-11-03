@@ -2,7 +2,7 @@
 
 Edit **Insta360 X5** 360° footage directly in **DaVinci Resolve Studio** on the Mac: stitch it, reframe it into normal or vertical video, and follow subjects automatically, without exporting from Insta360 Studio first.
 
-> **Windows port.** This copy also builds for Windows (x64): see [Windows](#windows) below. The macOS build files are unchanged but the shared sources now target the CPU/FFmpeg code paths, so build macOS from the original 0.4.1 release.
+> **Windows port** of [Ilias823/insta360-resolve](https://github.com/Ilias823/insta360-resolve) 0.4.1. Download the Windows installer from this fork's [Releases](../../releases); see [Windows](#windows) below for what differs. **Mac users: use the original**, this fork's shared sources target the CPU/FFmpeg code paths and do not build for macOS.
 
 Free and open source. If it saves you time, you can support its development on **[Ko-fi](https://ko-fi.com/ilias823)**.
 
@@ -99,6 +99,16 @@ The OpenFX SDK is vendored in `plugin/third_party` (Academy Software Foundation,
 ### Tests
 
 `make -C plugin -f Makefile.win PLATFORM=native test` builds the same code for Linux against the system FFmpeg and runs the self-checks and the optical-flow checks. `tools/compare_kernel.py` compares the CPU kernel with the Python reference (`stitch_poc.py`), as `compare_metal.py` did for Metal; `test_plugin --fullres lensA.mov lensB.mov ...` checks full-resolution decoding and the frame check against an independent decode.
+
+### Speed
+
+On an Intel Core i9-14900HX (32 threads) a 1920x1080 reframe from X5 8K footage with Full Resolution on takes 25 to 30 ms per frame, so 24 and 25 fps timelines play in real time. Decoding runs ahead in the background on the graphics card's video decoder. Slower CPUs: turn off Full Resolution or use Resolve's render cache.
+
+### Changes beyond the port
+
+- **Auto Stitch Distance** searches down to 0.25 m (0.4.1: 0.4 m) and pulls less towards the 2 m default (`DEPTH_PRIOR` 0.05 to 0.02). With the camera set down in grass or held close to things, 0.4.1 kept the seam at about 2 m. In a synthetic test with the camera 25 cm above textured ground it now finds 0.27 to 0.43 m along the seam instead of 1.7 to 2.0 m. `MetalKernel.mm` still has the 0.4.1 values (18 depth steps would not fit its 32 KB of threadgroup memory).
+- **Stitch Distance** can be typed up to 100 m (Resolve does not accept typed values beyond a slider's display range).
+- Version numbers add a fourth part for the port (0.4.1.1 is 0.4.1 plus Windows changes); Check for Updates looks at this fork's releases.
 
 ### Install
 
