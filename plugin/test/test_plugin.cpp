@@ -780,6 +780,27 @@ int main(int argc, char** argv)
     {
         return StitchFile(argc, argv);
     }
+    if (argc == 5 && strcmp(argv[1], "--tag") == 0)
+    {
+        // test_plugin --tag frame.raw width height: the clip number in a frame (float RGBA, top row first)
+        StitchParams params = {};
+        params.width = atoi(argv[3]);
+        params.height = atoi(argv[4]);
+        std::vector<float> in(size_t(params.width) * params.height * 4);
+        FILE* f = OpenFile(argv[2], "rb");
+        if (!f || fread(in.data(), sizeof(float), in.size(), f) != in.size())
+        {
+            return 1;
+        }
+        fclose(f);
+        FrameBuffer src;
+        src.data = reinterpret_cast<const unsigned char*>(in.data());
+        src.width = params.width;
+        src.height = params.height;
+        src.rowBytes = long(params.width) * 16;
+        printf("%06x\n", ReadClipTag(params, src) & 0xFFFFFF);
+        return 0;
+    }
     if (argc < 2)
     {
         fprintf(stderr, "usage: test_plugin path/to/Insta360Stitch.ofx\n");

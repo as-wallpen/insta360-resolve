@@ -169,7 +169,7 @@ def motion_data(path, frame_count, fps, camera):
 if __name__ == "__main__":
     import json
     clip, info_path, out = sys.argv[1:4]
-    info = json.loads(Path(info_path).read_text())
+    info = json.loads(Path(info_path).read_text(encoding="utf-8"))
     data = motion_data(clip, info["frames"], float(info["fps"]), info["camera"])
     if data is None:
         sys.exit("no usable motion data")

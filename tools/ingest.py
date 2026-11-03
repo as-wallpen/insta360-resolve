@@ -12,8 +12,12 @@ For each clip:
 usage: ingest.py clip.insv [more.insv ...] [--out DIR] [--no-resolve] [--no-refine] [--progress]
        ingest.py --refine clip.json [more.json ...]     (step 3 only, for clips ingested before)
 
-Uses the plugin's MediaTool when it is installed, otherwise ffmpeg/ffprobe on PATH. Step 4 needs Resolve Studio running with
+Uses the plugin's MediaTool when it is installed (macOS), otherwise ffmpeg/ffprobe: on Windows the copies inside
+the plugin bundle, else the ones on PATH. Step 4 needs Resolve Studio running with
 Preferences > System > General > External scripting set to Local.
+
+Windows: the Scripts-menu entry passes the chosen clips in a UTF-8 file (--list), since Resolve's
+Lua cannot hand file names outside the ANSI code page on a command line.
 """
 import argparse
 import json
@@ -22,6 +26,7 @@ import random
 import struct
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from fractions import Fraction
@@ -32,25 +37,46 @@ from insv_trailer import read_summary
 import clip_tag
 import insv_motion
 
-RESOLVE_API = "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting"
-RESOLVE_LIB = "/Applications/DaVinci Resolve/DaVinci Resolve.app/Contents/Libraries/Fusion/fusionscript.so"
+WINDOWS = sys.platform == "win32"
+if WINDOWS:
+    RESOLVE_API = os.path.join(os.environ.get("PROGRAMDATA", r"C:\ProgramData"),
+                               r"Blackmagic Design\DaVinci Resolve\Support\Developer\Scripting")
+    RESOLVE_LIB = r"C:\Program Files\Blackmagic Design\DaVinci Resolve\fusionscript.dll"
+else:
+    RESOLVE_API = "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting"
+    RESOLVE_LIB = "/Applications/DaVinci Resolve/DaVinci Resolve.app/Contents/Libraries/Fusion/fusionscript.so"
 BIN_NAME = "Insta360"
 SOURCE_BIN_NAME = "Source files"   # inside BIN_NAME, for the lens files
 # Helper programs inside the plugin bundle: the development build first, then the installed one.
 BUNDLE_RESOURCES = "Insta360Stitch.ofx.bundle/Contents/Resources"
-BUNDLE_DIRS = [Path(__file__).parent.parent / "plugin/build", Path("/Library/OFX/Plugins")]
+if WINDOWS:
+    BUNDLE_DIRS = [Path(__file__).parent.parent / "plugin/build-win",
+                   Path(os.environ.get("COMMONPROGRAMFILES", r"C:\Program Files\Common Files")) / "OFX/Plugins"]
+else:
+    BUNDLE_DIRS = [Path(__file__).parent.parent / "plugin/build", Path("/Library/OFX/Plugins")]
+# Other bundle folders to look in first, for tests: INSTA360_BUNDLE_DIRS, separated like PATH.
+BUNDLE_DIRS = [Path(d) for d in os.environ.get("INSTA360_BUNDLE_DIRS", "").split(os.pathsep) if d] + BUNDLE_DIRS
+EXE = ".exe" if WINDOWS else ""
+# Windows: no console window for each helper program. The tools print UTF-8.
+POPEN_ARGS = {"creationflags": 0x08000000} if WINDOWS else {}   # CREATE_NO_WINDOW
+TEXT_ARGS = {"text": True, "encoding": "utf-8", "errors": "replace"}
 REFINE_FRAMES = 10
 REFINE_SIZE = 1920        # lens image size the helper expects (kWorkSize in plugin/src/SeamRefine.cpp)
 VALUES_PER_LENS = 27
 
 
 def media_tool():
-    """The plugin's MediaTool (AVFoundation), used instead of ffmpeg when it is installed."""
+    """The plugin's MediaTool (AVFoundation, macOS), used instead of ffmpeg when it is installed."""
     return find_bundle_tool("MediaTool")
 
 
+def ffmpeg_tool(name):
+    """ffmpeg or ffprobe: the copy in the plugin bundle (Windows), else the one on PATH."""
+    return str(find_bundle_tool(name) or name)
+
+
 def media_probe(path):
-    done = subprocess.run([str(media_tool()), "probe", str(path)], capture_output=True, text=True)
+    done = subprocess.run([str(media_tool()), "probe", str(path)], capture_output=True, **TEXT_ARGS, **POPEN_ARGS)
     if done.returncode != 0:
         raise RuntimeError(done.stderr.strip() or f"cannot read {path.name}")
     return json.loads(done.stdout)
@@ -61,9 +87,9 @@ def probe(path):
         streams = media_probe(path)["streams"]
     else:
         out = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "v", "-show_entries",
+            [ffmpeg_tool("ffprobe"), "-v", "error", "-select_streams", "v", "-show_entries",
              "stream=index,width,height,r_frame_rate,nb_frames", "-of", "json", str(path)],
-            check=True, capture_output=True, text=True).stdout
+            check=True, capture_output=True, **TEXT_ARGS, **POPEN_ARGS).stdout
         streams = json.loads(out)["streams"]
     if len(streams) != 2:
         raise ValueError(f"{path.name}: expected 2 video streams, found {len(streams)}")
@@ -87,28 +113,35 @@ class Progress:
     def __init__(self, title, show):
         self.proc = None
         self.last_sent = 0.0
+        self.cancelled = threading.Event()
         helper = find_bundle_tool("TrackProgress") if show else None
         if helper:
             try:
-                self.proc = subprocess.Popen([str(helper), title], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
-                os.set_blocking(self.proc.stdout.fileno(), False)
+                self.proc = subprocess.Popen([str(helper), title], stdin=subprocess.PIPE, stdout=subprocess.PIPE, **POPEN_ARGS)
+                threading.Thread(target=self._watch, args=(self.proc,), daemon=True).start()
             except OSError:
                 self.proc = None
+
+    def _watch(self, proc):
+        """Waits for the window's Cancel button, on a thread of its own."""
+        try:
+            for line in proc.stdout:
+                if b"cancel" in line:
+                    self.cancelled.set()
+        except (OSError, ValueError):
+            pass
 
     def update(self, fraction, text, force=False):
         if self.proc is None:
             return
-        try:
-            if b"cancel" in (os.read(self.proc.stdout.fileno(), 256) or b""):
-                self.close()
-                raise Cancelled()
-        except BlockingIOError:
-            pass
+        if self.cancelled.is_set():
+            self.close()
+            raise Cancelled()
         now = time.monotonic()
         if force or now - self.last_sent >= 0.1:     # about ten updates a second is plenty
             self.last_sent = now
             try:
-                self.proc.stdin.write(f"p {min(max(fraction, 0.0), 1.0):.4f} {text}\n".encode())
+                self.proc.stdin.write(f"p {min(max(fraction, 0.0), 1.0):.4f} {text}\n".encode("utf-8"))
                 self.proc.stdin.flush()
             except OSError:
                 self.proc = None    # the window went away; carry on without it
@@ -126,7 +159,7 @@ class Progress:
 
 def run_tool_reporting(cmd, report):
     """Runs MediaTool split, passing its "progress <fraction>" lines to report(); stops it on Cancelled."""
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **TEXT_ARGS, **POPEN_ARGS)
     try:
         for line in proc.stdout:
             if line.startswith("progress "):
@@ -143,7 +176,7 @@ def run_tool_reporting(cmd, report):
 def run_reporting(cmd, seconds, report):
     """Runs ffmpeg with -progress, passing the fraction done to report(); stops it on Cancelled."""
     proc = subprocess.Popen(cmd[:1] + ["-progress", "pipe:1", "-nostats"] + cmd[1:],
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, **TEXT_ARGS, **POPEN_ARGS)
     try:
         for line in proc.stdout:
             if line.startswith("out_time_us=") and line.strip()[12:].isdigit():
@@ -168,7 +201,7 @@ def split(src, out_dir, report=lambda fraction: None):
             if media_tool():
                 run_tool_reporting([str(media_tool()), "split", str(src)] + [str(f) for f in parts], report)
             else:
-                cmd = ["ffmpeg", "-v", "error", "-y", "-i", str(src)]
+                cmd = [ffmpeg_tool("ffmpeg"), "-v", "error", "-y", "-i", str(src)]
                 for s, f in zip(streams, parts):
                     cmd += ["-map", f"0:{s['index']}", "-c", "copy", "-tag:v", "hvc1", str(f)]
                 run_reporting(cmd, duration(src), report)
@@ -183,7 +216,7 @@ def split(src, out_dir, report=lambda fraction: None):
     path = out_dir / f"{src.stem}.json"
     # A seam refinement made earlier from the same factory calibration is kept.
     try:
-        old = json.loads(path.read_text())
+        old = json.loads(path.read_text(encoding="utf-8"))
         if "seam_refinement" in old and old.get("calibration_factory") == info["calibration_raw"]:
             for key in ("calibration_factory", "lenses_factory", "calibration_raw", "lenses", "seam_refinement"):
                 info[key] = old[key]
@@ -199,13 +232,13 @@ def split(src, out_dir, report=lambda fraction: None):
         motion.write_bytes(data)
     info["motion"] = motion.name if data else ""
     try:
-        old_id = int(json.loads(path.read_text()).get("clip_id", -1))
+        old_id = int(json.loads(path.read_text(encoding="utf-8")).get("clip_id", -1))
     except (OSError, ValueError, KeyError):
         old_id = -1
-    path.write_text(json.dumps(info, indent=2))
+    path.write_text(json.dumps(info, indent=2), encoding="utf-8")
     info["clip_id"] = register_clip(path, lens_files, motion if data else None, old_id)
     info["tag"] = make_tag_movie(info, out_dir / f"{src.stem}_tag")
-    path.write_text(json.dumps(info, indent=2))
+    path.write_text(json.dumps(info, indent=2), encoding="utf-8")
     return lens_files[0], lens_files[1], info
 
 
@@ -216,14 +249,25 @@ def make_tag_movie(info, base):
     """
     png, movie = base.with_suffix(".png"), base.with_suffix(".mov")
     clip_tag.write_tag_png(info["clip_id"], png, 512, 256)
-    tool = media_tool()
-    if tool is None:
-        return ""
     rate = str(Fraction(info["fps"]).limit_denominator(1001)) if "/" not in str(info["fps"]) else info["fps"]
     rate = {"29.97": "30000/1001", "59.94": "60000/1001", "23.976": "24000/1001"}.get(str(info["fps"]), rate)
-    done = subprocess.run([str(tool), "still", str(png), str(info["frames"]), rate, str(movie)], capture_output=True, text=True)
+    tool = media_tool()
+    if tool is not None:
+        cmd = [str(tool), "still", str(png), str(info["frames"]), rate, str(movie)]
+    else:
+        # ffmpeg (Windows): the same ProRes 4444 movie with transparency. The track's time scale
+        # holds the frame rate exactly, so Resolve sees 29.97 and not 30 fps (as MediaTool does it).
+        r = Fraction(rate)
+        timescale = r.numerator if r.denominator != 1 else r.numerator * 1000
+        cmd = [ffmpeg_tool("ffmpeg"), "-v", "error", "-y", "-framerate", rate, "-loop", "1", "-i", str(png),
+               "-frames:v", str(info["frames"]), "-c:v", "prores_ks", "-profile:v", "4444", "-pix_fmt", "yuva444p10le",
+               "-vendor", "apl0", "-video_track_timescale", str(timescale), str(movie)]
+    try:
+        done = subprocess.run(cmd, capture_output=True, **TEXT_ARGS, **POPEN_ARGS)
+    except OSError:
+        done = None
     png.unlink(missing_ok=True)
-    return str(movie) if done.returncode == 0 else ""
+    return str(movie) if done is not None and done.returncode == 0 else ""
 
 
 def register_clip(info_path, lens_files, motion_path, clip_id=-1):
@@ -240,7 +284,7 @@ def register_clip(info_path, lens_files, motion_path, clip_id=-1):
             clip_id = random.randrange(1, 1 << 24)
     entry = {"info": str(Path(info_path).resolve()), "lens_a": str(Path(lens_files[0]).resolve()),
              "lens_b": str(Path(lens_files[1]).resolve()), "motion": str(Path(motion_path).resolve()) if motion_path else ""}
-    (folder / f"{clip_id:06x}.json").write_text(json.dumps(entry, indent=2))
+    (folder / f"{clip_id:06x}.json").write_text(json.dumps(entry, indent=2), encoding="utf-8")
     return clip_id
 
 
@@ -284,8 +328,8 @@ def apply_refinement(info, x, before, after, frames, force=False):
 def duration(path):
     if media_tool():
         return float(media_probe(path)["duration"])
-    out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)],
-                         check=True, capture_output=True, text=True).stdout
+    out = subprocess.run([ffmpeg_tool("ffprobe"), "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)],
+                         check=True, capture_output=True, **TEXT_ARGS, **POPEN_ARGS).stdout
     return float(out)
 
 
@@ -293,10 +337,10 @@ def read_frame(path, seconds, pix_fmt="rgb24"):
     """One frame of a lens file, scaled to REFINE_SIZE square, as raw 8-bit pixels."""
     if media_tool() and pix_fmt == "rgb24":
         return subprocess.run([str(media_tool()), "frame", str(path), f"{seconds:.3f}", str(REFINE_SIZE)],
-                              check=True, capture_output=True).stdout
-    return subprocess.run(["ffmpeg", "-v", "error", "-ss", f"{seconds:.3f}", "-i", str(path), "-frames:v", "1",
+                              check=True, capture_output=True, **POPEN_ARGS).stdout
+    return subprocess.run([ffmpeg_tool("ffmpeg"), "-v", "error", "-ss", f"{seconds:.3f}", "-i", str(path), "-frames:v", "1",
                            "-vf", f"scale={REFINE_SIZE}:{REFINE_SIZE}", "-f", "rawvideo", "-pix_fmt", pix_fmt, "-"],
-                          check=True, capture_output=True).stdout
+                          check=True, capture_output=True, **POPEN_ARGS).stdout
 
 
 def refine_times(lens_a, lens_b, frames):
@@ -307,8 +351,8 @@ def refine_times(lens_a, lens_b, frames):
 
 def find_bundle_tool(name):
     for folder in BUNDLE_DIRS:
-        if (folder / BUNDLE_RESOURCES / name).exists():
-            return folder / BUNDLE_RESOURCES / name
+        if (folder / BUNDLE_RESOURCES / (name + EXE)).exists():
+            return folder / BUNDLE_RESOURCES / (name + EXE)
     return None
 
 
@@ -319,7 +363,7 @@ def measure_seam(lens_a, lens_b, factory_raw, frames=REFINE_FRAMES, helper=None,
         raise RuntimeError("SeamRefine helper not found: install the plugin (make -C plugin install)")
     paths = [p for t in refine_times(lens_a, lens_b, frames) for p in ((lens_a, t), (lens_b, t))]
     proc = subprocess.Popen([str(helper), factory_raw, str(frames)], stdin=subprocess.PIPE,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, **POPEN_ARGS)
     try:
         # Decoding is the slow part, so several frames decode at once; they reach the helper in order.
         with ThreadPoolExecutor(4) as pool:
@@ -335,14 +379,19 @@ def measure_seam(lens_a, lens_b, factory_raw, frames=REFINE_FRAMES, helper=None,
         raise
     out, err = proc.communicate()
     if proc.returncode != 0:
-        raise RuntimeError(f"SeamRefine failed: {err.decode().strip()}")
+        raise RuntimeError(f"SeamRefine failed: {err.decode('utf-8', 'replace').strip()}")
     return json.loads(out)
 
 
 # The lens-B correction is the same for every clip of a camera, so good measurements are kept
 # per camera: clips whose seam shows too little detail to measure (dark scenes, plain walls)
 # borrow them. The latest import's calibration is also where the plugin looks by default.
-SUPPORT_DIR = Path.home() / "Library/Application Support/Insta360Stitch"
+if WINDOWS:   # where the plugin looks (SupportDir() in plugin/src/Platform.cpp)
+    SUPPORT_DIR = Path(os.environ.get("APPDATA") or Path.home() / "AppData/Roaming") / "Insta360Stitch"
+elif sys.platform == "darwin":
+    SUPPORT_DIR = Path.home() / "Library/Application Support/Insta360Stitch"
+else:
+    SUPPORT_DIR = Path.home() / ".local/share/Insta360Stitch"
 DEFAULT_CALIBRATION = SUPPORT_DIR / "default-calibration.json"   # read by the plugin (Calibration.cpp)
 MAX_REMEMBERED_FITS = 20
 
@@ -354,7 +403,7 @@ def camera_profile_path(serial):
 def camera_refinement(serial):
     """Median of this camera's good seam fits as [yaw, pitch, cx, cy], or None."""
     try:
-        fits = json.loads(camera_profile_path(serial).read_text())["fits"]
+        fits = json.loads(camera_profile_path(serial).read_text(encoding="utf-8"))["fits"]
     except (OSError, ValueError, KeyError):
         return None
     if not fits:
@@ -365,19 +414,19 @@ def camera_refinement(serial):
 def remember_fit(serial, x):
     path = camera_profile_path(serial)
     try:
-        fits = json.loads(path.read_text())["fits"]
+        fits = json.loads(path.read_text(encoding="utf-8"))["fits"]
     except (OSError, ValueError, KeyError):
         fits = []
     fits = (fits + [[float(v) for v in x]])[-MAX_REMEMBERED_FITS:]
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"serial": serial, "fits": fits}, indent=2))
+    path.write_text(json.dumps({"serial": serial, "fits": fits}, indent=2), encoding="utf-8")
 
 
 def write_default_calibration(info):
     """Makes this clip's calibration the plugin's default (used when its Calibration File is empty)."""
     SUPPORT_DIR.mkdir(parents=True, exist_ok=True)
     DEFAULT_CALIBRATION.write_text(json.dumps({"calibration_raw": info["calibration_raw"],
-                                               "serial": info.get("serial", ""), "clip": info.get("source", "")}))
+                                               "serial": info.get("serial", ""), "clip": info.get("source", "")}), encoding="utf-8")
 
 
 def borrow_camera_refinement(path):
@@ -385,26 +434,26 @@ def borrow_camera_refinement(path):
 
     Returns True if it did.
     """
-    info = json.loads(path.read_text())
+    info = json.loads(path.read_text(encoding="utf-8"))
     x = camera_refinement(info.get("serial"))
     if x is None or info.get("seam_refinement", {}).get("applied"):
         return False
     before, after = info.get("seam_refinement", {}).get("misalignment_px", [0.0, 0.0])
     apply_refinement(info, x, before, after, 0, force=True)
     info["seam_refinement"]["from_camera"] = True
-    path.write_text(json.dumps(info, indent=2))
+    path.write_text(json.dumps(info, indent=2), encoding="utf-8")
     write_default_calibration(info)
     return True
 
 
 def refine(path, lens_a, lens_b, report=lambda fraction: None):
     """Measures and stores the seam refinement in the clip's .json; returns a short note."""
-    info = json.loads(path.read_text())
+    info = json.loads(path.read_text(encoding="utf-8"))
     fit = measure_seam(lens_a, lens_b, info.get("calibration_factory", info["calibration_raw"]), report=report)
     x = [fit["yaw"], fit["pitch"], fit["cx"], fit["cy"]]
     before, after = fit["misalignment_px"]
     applied = apply_refinement(info, x, before, after, fit["frames"])
-    path.write_text(json.dumps(info, indent=2))
+    path.write_text(json.dumps(info, indent=2), encoding="utf-8")
     if applied:
         remember_fit(info.get("serial"), x)
         write_default_calibration(info)
@@ -537,7 +586,12 @@ def build(project, lens_a, lens_b, info, name):
 
 
 def notify(lines):
-    """Shows the result in a macOS dialog, for runs started from Resolve's Scripts menu."""
+    """Shows the result in a dialog, for runs started from Resolve's Scripts menu."""
+    if WINDOWS:
+        import ctypes
+        # MB_ICONINFORMATION | MB_TOPMOST | MB_SETFOREGROUND
+        ctypes.windll.user32.MessageBoxW(None, "\n".join(lines), "Insta360 Import", 0x40 | 0x40000 | 0x10000)
+        return
     text = "\n".join(lines).replace("\\", "\\\\").replace('"', '\\"')
     subprocess.run(["osascript", "-e", f'display dialog "{text}" with title "Insta360 Import" '
                     'buttons {"OK"} default button 1'], capture_output=True)
@@ -545,7 +599,8 @@ def notify(lines):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("clips", nargs="+", type=Path)
+    ap.add_argument("clips", nargs="*", type=Path)
+    ap.add_argument("--list", type=Path, help="a UTF-8 text file with more clips, one path per line")
     ap.add_argument("--out", type=Path, help="folder for the lens files (default: 'insta360_ingest' beside each clip)")
     ap.add_argument("--no-resolve", action="store_true", help="only split and write the calibration file")
     ap.add_argument("--no-refine", action="store_true", help="keep the factory calibration as it is")
@@ -555,6 +610,10 @@ def main():
     ap.add_argument("--report", type=Path, help="write one tab-separated line per clip for the Scripts-menu entry: "
                     "name, lens A, lens B, width, height, fps, note, tag image (or FAILED and a message)")
     args = ap.parse_args()
+    if args.list:
+        args.clips += [Path(line.strip()) for line in args.list.read_text(encoding="utf-8-sig").splitlines() if line.strip()]
+    if not args.clips:
+        ap.error("no clips given")
     if args.refine:
         return refine_existing(args.clips)
 
@@ -627,7 +686,7 @@ def main():
                 pass
 
     if args.report:
-        args.report.write_text("".join("\t".join(c.replace("\t", " ").replace("\n", " ") for c in r) + "\n" for r in rows))
+        args.report.write_text("".join("\t".join(c.replace("\t", " ").replace("\n", " ") for c in r) + "\n" for r in rows), encoding="utf-8")
     if args.notify:
         if project and failed < len(args.clips):
             results.append("\nThe clips are in the 'Insta360' bin. Add the Insta360 Stitch effect to use them.")

@@ -1,0 +1,26 @@
+
+------------------------------------------------------------------------
+Windows port
+------------------------------------------------------------------------
+
+The Windows build also contains:
+
+FFmpeg (libavformat, libavcodec, libavutil, libswscale, libswresample,
+libavfilter; ffmpeg.exe and ffprobe.exe), https://ffmpeg.org, built as a
+static library with only LGPL components (HEVC/H.264 decoding, MOV, ProRes
+encoding). FFmpeg is licensed under the GNU Lesser General Public License
+version 2.1 or later. Its source code is available at
+https://github.com/FFmpeg/FFmpeg (release 7.1.1); the configuration used is
+in tools/build_ffmpeg_windows.sh of this project's source.
+
+zlib, https://zlib.net, (C) 1995-2024 Jean-loup Gailly and Mark Adler,
+under the zlib licence.
+
+The MinGW-w64 runtime and the GCC runtime libraries (libstdc++, libgcc,
+winpthreads), under their runtime library exceptions and the MIT/ZPL
+licences of MinGW-w64.
+
+The OpenFX support library comes from the OpenFX SDK of the Academy
+Software Foundation (https://github.com/AcademySoftwareFoundation/openfx,
+BSD 3-Clause licence, see above), with access to the OpenFX draw suite
+added for the on-screen controls.

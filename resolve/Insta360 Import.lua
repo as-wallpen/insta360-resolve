@@ -7,18 +7,51 @@
 --
 -- Everything that touches the project happens here, inside Resolve, so no external scripting
 -- setting is needed. @INGEST@ is filled in when the script is installed.
-local INGEST = "@INGEST@"
+--
+-- Windows: dialogs come from PowerShell, and file names travel in UTF-8 files rather than on
+-- command lines, which Resolve's Lua can only pass in the ANSI code page.
+local INGEST = [[@INGEST@]]
+-- Windows installs write %ProgramData%\... here; expand such variables.
+INGEST = INGEST:gsub("%%([%w_]+)%%", function(name) return os.getenv(name) end)
 local BIN_NAME = "Insta360"
 local SOURCE_BIN_NAME = "Source files"   -- inside BIN_NAME: the lens files the 360 clips are made from
-local PYTHONS = {
-    "/Applications/DaVinci Resolve/DaVinci Resolve.app/Contents/Applications/ResolvePython",
-    "/opt/homebrew/bin/python3",
-    "/usr/local/bin/python3",
-    "/usr/bin/python3",
-}
+local WINDOWS = package.config:sub(1, 1) == "\\"
+local TEMP = WINDOWS and (os.getenv("TEMP") or os.getenv("TMP") or "C:\\Windows\\Temp") or "/tmp"
+local RUN_ID = tostring(os.time()) .. "-" .. tostring(math.random(100000, 999999))
+
+local PYTHONS
+if WINDOWS then
+    -- Resolve 21.1 and later bring a Python; otherwise one from python.org, for this user or all users.
+    local programs = os.getenv("ProgramFiles") or "C:\\Program Files"
+    local userPrograms = (os.getenv("LOCALAPPDATA") or "") .. "\\Programs\\Python"
+    PYTHONS = {programs .. "\\Blackmagic Design\\DaVinci Resolve\\ResolvePython\\ResolvePython.exe"}
+    for minor = 14, 9, -1 do
+        table.insert(PYTHONS, userPrograms .. "\\Python3" .. minor .. "\\python.exe")
+        table.insert(PYTHONS, programs .. "\\Python3" .. minor .. "\\python.exe")
+    end
+else
+    PYTHONS = {
+        "/Applications/DaVinci Resolve/DaVinci Resolve.app/Contents/Applications/ResolvePython",
+        "/opt/homebrew/bin/python3",
+        "/usr/local/bin/python3",
+        "/usr/bin/python3",
+    }
+end
 
 local function quote(s)
+    if WINDOWS then
+        return '"' .. s .. '"'
+    end
     return "'" .. (s:gsub("'", "'\\''")) .. "'"
+end
+
+-- Runs a command line. cmd.exe drops the first and the last quote of what it is given, so on
+-- Windows the whole line goes in one more pair.
+local function run(command)
+    if WINDOWS then
+        return os.execute('"' .. command .. '"')
+    end
+    return os.execute(command)
 end
 
 local function exists(path)
@@ -30,14 +63,70 @@ local function exists(path)
     return false
 end
 
+local function writeFile(path, text)
+    local f = io.open(path, "wb")
+    if not f then
+        return false
+    end
+    f:write(text)
+    f:close()
+    return true
+end
+
+-- A PowerShell script in TEMP (as UTF-8 with a byte order mark, which Windows PowerShell 5 needs
+-- to read anything outside ASCII), run without a console window, then removed.
+local function powershell(name, lines)
+    local script = TEMP .. "\\insta360-" .. name .. "-" .. RUN_ID .. ".ps1"
+    if not writeFile(script, "\239\187\191" .. table.concat(lines, "\r\n") .. "\r\n") then
+        return false
+    end
+    run("powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File " .. quote(script))
+    os.remove(script)
+    return true
+end
+
 local function dialog(text)
-    os.execute("osascript -e " .. quote('display dialog "' .. text:gsub("\\", "\\\\"):gsub('"', '\\"')
+    if WINDOWS then
+        -- The text goes through a file: it can hold any character, and PowerShell reads it as UTF-8.
+        local name = "insta360-message-" .. RUN_ID .. ".txt"
+        writeFile(TEMP .. "\\" .. name, text)
+        powershell("message", {
+            "Add-Type -AssemblyName System.Windows.Forms",
+            "$owner = New-Object System.Windows.Forms.Form -Property @{TopMost = $true; ShowInTaskbar = $false}",
+            "$text = [IO.File]::ReadAllText((Join-Path $env:TEMP '" .. name .. "'), [Text.Encoding]::UTF8)",
+            "[void][System.Windows.Forms.MessageBox]::Show($owner, $text, 'Insta360 Import')",
+        })
+        os.remove(TEMP .. "\\" .. name)
+        return
+    end
+    run("osascript -e " .. quote('display dialog "' .. text:gsub("\\", "\\\\"):gsub('"', '\\"')
         .. '" with title "Insta360 Import" buttons {"OK"} default button 1') .. " >/dev/null 2>&1")
 end
 
--- Clips to import: INSTA360_FILES (newline separated) skips the file dialog, for testing.
+-- The clips the user picks, one path per line (UTF-8 on Windows, where the file dialog writes
+-- them to a file). INSTA360_FILES (newline separated) skips the file dialog, for testing.
+local listFile = TEMP .. (WINDOWS and "\\" or "/") .. "insta360-clips-" .. RUN_ID .. ".txt"
 local list = os.getenv("INSTA360_FILES")
-if not list then
+if list then
+    writeFile(listFile, list)
+elseif WINDOWS then
+    powershell("choose", {
+        "Add-Type -AssemblyName System.Windows.Forms",
+        "$owner = New-Object System.Windows.Forms.Form -Property @{TopMost = $true; ShowInTaskbar = $false}",
+        "$d = New-Object System.Windows.Forms.OpenFileDialog",
+        "$d.Title = 'Choose Insta360 .insv clips to import'",
+        "$d.Filter = 'Insta360 clips (*.insv)|*.insv|All files (*.*)|*.*'",
+        "$d.Multiselect = $true",
+        "if ($d.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) {",
+        "    [IO.File]::WriteAllLines((Join-Path $env:TEMP 'insta360-clips-" .. RUN_ID .. ".txt'), $d.FileNames, (New-Object System.Text.UTF8Encoding $false))",
+        "}",
+    })
+    local f = io.open(listFile, "rb")
+    list = f and f:read("*a") or ""
+    if f then
+        f:close()
+    end
+else
     local script = {
         'set picked to choose file with prompt "Choose Insta360 .insv clips to import" with multiple selections allowed',
         'set out to ""',
@@ -53,14 +142,16 @@ if not list then
     local pipe = io.popen(cmd .. " 2>/dev/null")
     list = pipe:read("*a")
     pipe:close()
+    writeFile(listFile, list)
 end
-local files = {}
-for path in list:gmatch("[^\n]+") do
+local count = 0
+for path in list:gmatch("[^\r\n]+") do
     if path:lower():match("%.insv$") then
-        table.insert(files, quote(path))
+        count = count + 1
     end
 end
-if #files == 0 then
+if count == 0 then
+    os.remove(listFile)
     print("Insta360 Import: no .insv files chosen")
     return
 end
@@ -68,6 +159,7 @@ end
 local resolveApp = resolve or (Resolve and Resolve()) or (bmd and bmd.scriptapp("Resolve"))
 local project = resolveApp and resolveApp:GetProjectManager():GetCurrentProject()
 if not project then
+    os.remove(listFile)
     dialog("Open a project in DaVinci Resolve first.")
     return
 end
@@ -80,14 +172,22 @@ for _, candidate in ipairs(PYTHONS) do
     end
 end
 if not python then
-    dialog("No Python found. Insta360 Import needs DaVinci Resolve 21.1 or later, which includes one.")
+    os.remove(listFile)
+    dialog(WINDOWS and "No Python found. Insta360 Import needs DaVinci Resolve 21.1 or later, which includes one, "
+        .. "or Python 3 from python.org." or "No Python found. Insta360 Import needs DaVinci Resolve 21.1 or later, which includes one.")
     return
 end
 
 -- 1. Copy the lenses and work out the calibration (shows its own progress window).
-local report = os.tmpname()
-os.execute(quote(python) .. " " .. quote(INGEST) .. " --no-resolve --progress --report " .. quote(report) .. " "
-    .. table.concat(files, " ") .. " >/dev/null 2>&1")
+local report = TEMP .. (WINDOWS and "\\" or "/") .. "insta360-report-" .. RUN_ID .. ".tsv"
+local arguments = quote(INGEST) .. " --no-resolve --progress --report " .. quote(report) .. " --list " .. quote(listFile)
+if WINDOWS then
+    -- Its console window stays minimised; the progress window shows what is going on.
+    run('start "" /min /wait ' .. quote(python) .. " " .. arguments)
+else
+    run(quote(python) .. " " .. arguments .. " >/dev/null 2>&1")
+end
+os.remove(listFile)
 
 local clips, messages = {}, {}
 local f = io.open(report, "r")
@@ -145,13 +245,15 @@ end
 pool:SetCurrentFolder(folder)
 
 local function basename(path)
-    return path:match("([^/]+)$")
+    return path:match("([^/\\]+)$")
 end
 
 -- The clip's tag (see tools/clip_tag.py), a transparent movie as long as the clip, over it on a
 -- third track, so the plugin can tell which clip it is working on.
 local function addTagTrack(timeline, tagPath, start)
-    if tagPath == "" or not exists(tagPath) then
+    -- (Lua cannot check files with names outside the ANSI code page on Windows; the import tool
+    -- only reports a tag movie it has made.)
+    if tagPath == "" or (not WINDOWS and not exists(tagPath)) then
         return {}, nil
     end
     local imported = pool:ImportMedia({tagPath}) or {}
@@ -167,7 +269,8 @@ local function addTagTrack(timeline, tagPath, start)
 end
 
 -- Diagnostics for layouts Resolve did not accept, in a file the user can send.
-local LOG = (os.getenv("HOME") or "/tmp") .. "/Library/Logs/Insta360Import.log"
+local LOG = WINDOWS and ((os.getenv("APPDATA") or TEMP) .. "\\Insta360Stitch\\Insta360Import.log")
+    or ((os.getenv("HOME") or "/tmp") .. "/Library/Logs/Insta360Import.log")
 local function log(text)
     local f = io.open(LOG, "a")
     if f then
@@ -261,7 +364,7 @@ local function build(clip)
     -- only needs it to be 2:1, and the lens shift is worked out from the size it really has.
     if not gotW or not gotH or gotW <= 0 or math.abs(gotW - 2 * gotH) > 2 then
         return string.format("FAILED: Resolve would not make a 2:1 timeline for the lenses (asked %dx%d, got %sx%s). "
-            .. "Please send ~/Library/Logs/Insta360Import.log", width, height, tostring(gotW), tostring(gotH))
+            .. "Please send " .. LOG, width, height, tostring(gotW), tostring(gotH))
     end
     width, height = gotW, gotH
 
@@ -278,7 +381,7 @@ local function build(clip)
     for _, placed in ipairs({{itemA, -1}, {itemB, 1}}) do
         local ok, problem = placeLens(placed[1], placed[2], width)
         if not ok then
-            return "FAILED: Resolve did not accept the lens layout (" .. problem .. "). Please send ~/Library/Logs/Insta360Import.log"
+            return "FAILED: Resolve did not accept the lens layout (" .. problem .. "). Please send " .. LOG
         end
     end
     local tagItems, tagMedia = addTagTrack(timeline, clip.tag, start)
