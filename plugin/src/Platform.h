@@ -38,5 +38,8 @@ std::wstring Widen(const std::string& p_Utf8);
 std::string Narrow(const std::wstring& p_Wide);
 #endif
 
+// "CPU <name>, <n> threads; GPU <name>", for the log.
+std::string SystemDescription();
+
 // Creates a folder and the folders it is in; true if it exists afterwards.
 bool MakeDirectories(const std::string& p_Path);

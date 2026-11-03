@@ -1,6 +1,7 @@
 #include "Platform.h"
 
 #include <cstdlib>
+#include <thread>
 #include <sys/stat.h>
 
 #ifdef _WIN32
@@ -9,6 +10,7 @@
 #endif
 #include <windows.h>
 #include <shlobj.h>
+#include <dxgi.h>
 #else
 #include <dlfcn.h>
 #endif
@@ -210,4 +212,42 @@ bool MakeDirectories(const std::string& p_Path)
     mkdir(p_Path.c_str(), 0755);
 #endif
     return FileExists(p_Path);
+}
+
+std::string SystemDescription()
+{
+    std::string cpu = "unknown";
+    std::string gpu = "unknown";
+#ifdef _WIN32
+    wchar_t name[256] = {};
+    DWORD size = sizeof(name);
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, L"HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0", L"ProcessorNameString", RRF_RT_REG_SZ,
+                     nullptr, name, &size) == ERROR_SUCCESS)
+    {
+        cpu = Narrow(name);
+    }
+    // The first graphics adapter, the one FFmpeg's D3D11VA decoder uses.
+    if (HMODULE dxgi = LoadLibraryW(L"dxgi.dll"))
+    {
+        typedef HRESULT(WINAPI * CreateFactory)(REFIID, void**);
+        CreateFactory create = reinterpret_cast<CreateFactory>(reinterpret_cast<void*>(GetProcAddress(dxgi, "CreateDXGIFactory1")));
+        IDXGIFactory1* factory = nullptr;
+        if (create && SUCCEEDED(create(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory))) && factory)
+        {
+            IDXGIAdapter1* adapter = nullptr;
+            DXGI_ADAPTER_DESC1 desc;
+            if (SUCCEEDED(factory->EnumAdapters1(0, &adapter)) && adapter && SUCCEEDED(adapter->GetDesc1(&desc)))
+            {
+                gpu = Narrow(desc.Description);
+            }
+            if (adapter)
+            {
+                adapter->Release();
+            }
+            factory->Release();
+        }
+        FreeLibrary(dxgi);
+    }
+#endif
+    return "CPU " + cpu + ", " + std::to_string(std::thread::hardware_concurrency()) + " threads; GPU " + gpu;
 }

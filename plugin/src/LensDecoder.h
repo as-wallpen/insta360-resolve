@@ -39,6 +39,10 @@ struct LensImages
 // cannot be read or has no such frame. Safe to call from several render threads at once.
 bool AcquireLensImages(const std::string& p_LensA, const std::string& p_LensB, int p_Frame, LensImages& p_Images);
 
+// Where the time goes, for the log: decoder in use and average milliseconds per frame pair
+// since the last call (decoding, building mip levels). Resets the averages.
+std::string LensDecoderStats();
+
 // Lets go of all decoders and cached frames (the host asked the effect to free memory).
 void ReleaseLensDecoders();
 

@@ -273,6 +273,15 @@ public:
         return nullptr;
     }
 
+    // "D3D11VA" etc. while the open decoder runs on the GPU, "" in software.
+    std::string hardwareName()
+    {
+        std::lock_guard<std::mutex> lock(m_Mutex);
+        return m_Hardware && !m_Choice.failed && m_Codec && m_Codec->hw_device_ctx
+                   ? av_hwdevice_get_type_name(reinterpret_cast<AVHWDeviceContext*>(m_Codec->hw_device_ctx->data)->type)
+                   : "";
+    }
+
     // Lets go of the decoder after a while without use.
     void releaseIfIdle(double p_Now)
     {
@@ -532,6 +541,12 @@ std::map<std::string, std::shared_ptr<LensReader>> s_Readers; // by file path
 std::list<CachedFrame> s_Frames;                              // most recently used first
 double s_LastSweep = 0.0;
 
+// Timing for the log (LensDecoderStats).
+std::mutex s_StatsMutex;
+double s_DecodeSeconds = 0.0, s_MipSeconds = 0.0;
+int s_StatFrames = 0, s_HardwareFrames = 0;
+std::string s_HardwareName;
+
 std::shared_ptr<LensReader> ReaderFor(const std::string& p_Path)
 {
     std::shared_ptr<LensReader>& reader = s_Readers[p_Path];
@@ -629,9 +644,11 @@ bool AcquireLensImages(const std::string& p_LensA, const std::string& p_LensB, i
         // Both lenses at once; each reader has its own lock, so concurrent renders of other
         // frames wait only for the lens they need.
         pair = std::make_shared<FramePair>();
+        const double decodeStart = SecondsNow();
         std::thread other([&]() { pair->lens[1] = readers[1]->frame(p_Frame); });
         pair->lens[0] = readers[0]->frame(p_Frame);
         other.join();
+        const double decoded = SecondsNow();
         if (!pair->lens[0] || !pair->lens[1])
         {
             return false;
@@ -645,6 +662,18 @@ bool AcquireLensImages(const std::string& p_LensA, const std::string& p_LensB, i
         std::thread mips([&]() { pair->lens[1]->buildMips(); });
         pair->lens[0]->buildMips();
         mips.join();
+        {
+            std::lock_guard<std::mutex> lock(s_StatsMutex);
+            s_DecodeSeconds += decoded - decodeStart;
+            s_MipSeconds += SecondsNow() - decoded;
+            ++s_StatFrames;
+            const std::string hw = readers[0]->hardwareName();
+            if (!hw.empty())
+            {
+                ++s_HardwareFrames;
+                s_HardwareName = hw;
+            }
+        }
 
         std::lock_guard<std::mutex> lock(s_Mutex);
         s_Frames.push_front(CachedFrame{clip, p_Frame, SecondsNow(), pair});
@@ -664,6 +693,19 @@ bool AcquireLensImages(const std::string& p_LensA, const std::string& p_LensB, i
     p_Images.bits = pair->lens[0]->bits;
     p_Images.owner = pair;
     return true;
+}
+
+std::string LensDecoderStats()
+{
+    std::lock_guard<std::mutex> lock(s_StatsMutex);
+    char line[256];
+    const int n = std::max(s_StatFrames, 1);
+    snprintf(line, sizeof(line), "decoder %s (%d of %d frames on the GPU), %.0f ms decoding, %.0f ms mip levels per frame",
+             s_HardwareName.empty() ? "software" : s_HardwareName.c_str(), s_HardwareFrames, s_StatFrames, s_DecodeSeconds * 1000.0 / n,
+             s_MipSeconds * 1000.0 / n);
+    s_DecodeSeconds = s_MipSeconds = 0.0;
+    s_StatFrames = s_HardwareFrames = 0;
+    return line;
 }
 
 void ReleaseLensDecoders()

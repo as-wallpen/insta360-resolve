@@ -94,6 +94,20 @@ static double SecondsNow()
 // button was pressed.
 static std::atomic<double> s_OverlayDrawn{0.0};
 
+// Timing for the log, every kTimingEvery renders: where the time per frame goes.
+#define kTimingEvery 50
+static std::mutex s_TimingMutex;
+static double s_RenderSeconds = 0.0, s_AcquireSeconds = 0.0, s_StitchSeconds = 0.0;
+static int s_RenderCount = 0;
+
+static bool TimedAcquire(const std::string& p_LensA, const std::string& p_LensB, int p_Frame, LensImages& p_Images, double& p_Seconds)
+{
+    const double start = SecondsNow();
+    const bool ok = AcquireLensImages(p_LensA, p_LensB, p_Frame, p_Images);
+    p_Seconds = SecondsNow() - start;
+    return ok;
+}
+
 #define kFovMin 10.0
 
 // Order of the View menu; the kernel modes are numbered differently.
@@ -932,6 +946,8 @@ void StitchPlugin::render(const OFX::RenderArguments& p_Args)
         OFX::throwSuiteStatusException(kOfxStatErrValue);
     }
 
+    const double renderStart = SecondsNow();
+    double acquireSeconds = 0.0, stitchSeconds = 0.0;
     const OfxRectI& sb = src->getBounds();
     const OfxRectI& db = dst->getBounds();
     const OfxRectD rod = m_SrcClip->getRegionOfDefinition(p_Args.time);
@@ -1027,7 +1043,7 @@ void StitchPlugin::render(const OFX::RenderArguments& p_Args)
         {
             LogOnce("full resolution: the clip's lens files are not registered; using Resolve's picture");
         }
-        else if (!AcquireLensImages(files.lensA, files.lensB, int(lround(p_Args.time)), lensImages))
+        else if (!TimedAcquire(files.lensA, files.lensB, int(lround(p_Args.time)), lensImages, acquireSeconds))
         {
             LogOnce("ERROR: full resolution: cannot decode " + files.lensA + " / " + files.lensB + "; using Resolve's picture");
         }
@@ -1065,7 +1081,10 @@ void StitchPlugin::render(const OFX::RenderArguments& p_Args)
     window.x2 = p_Args.renderWindow.x2 - db.x1;
     window.y1 = p_Args.renderWindow.y1 - db.y1;
     window.y2 = p_Args.renderWindow.y2 - db.y1;
-    if (!RunStitchKernel(params, input, output, params.fullRes != 0 ? &lensImages : nullptr, m_FullResCheck, window))
+    stitchSeconds = -SecondsNow();
+    const bool stitched = RunStitchKernel(params, input, output, params.fullRes != 0 ? &lensImages : nullptr, m_FullResCheck, window);
+    stitchSeconds += SecondsNow();
+    if (!stitched)
     {
         LogOnce("ERROR: the stitch could not run on this frame");
         OFX::throwSuiteStatusException(kOfxStatFailed);
@@ -1105,6 +1124,21 @@ void StitchPlugin::render(const OFX::RenderArguments& p_Args)
         {
             LogOnce("motion blur: skipped, the neighbouring frames could not be read from the lens files");
         }
+    }
+
+    std::lock_guard<std::mutex> lock(s_TimingMutex);
+    s_RenderSeconds += SecondsNow() - renderStart;
+    s_AcquireSeconds += acquireSeconds;
+    s_StitchSeconds += stitchSeconds;
+    if (++s_RenderCount >= kTimingEvery)
+    {
+        char timing[512];
+        snprintf(timing, sizeof(timing), "timing over %d frames of %dx%d: %.0f ms per frame in all, %.0f ms getting the lenses, %.0f ms stitching; %s; %s",
+                 s_RenderCount, params.width, params.height, s_RenderSeconds * 1000.0 / s_RenderCount, s_AcquireSeconds * 1000.0 / s_RenderCount,
+                 s_StitchSeconds * 1000.0 / s_RenderCount, LensDecoderStats().c_str(), SystemDescription().c_str());
+        LogOnce(timing);
+        s_RenderSeconds = s_AcquireSeconds = s_StitchSeconds = 0.0;
+        s_RenderCount = 0;
     }
 }
 

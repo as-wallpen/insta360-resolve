@@ -366,6 +366,7 @@ static int FullResFile(int argc, char** argv)
         RunKernelWith(full, in, scratch, &next);
     }
     const double perFrame = (Seconds() - start) / count;
+    printf("%s\n", LensDecoderStats().c_str());
     printf("lenses %dx%d %d-bit; first frame decode %.0f ms, render %.0f ms; then %.1f ms a frame (%.1f fps) at %dx%d\n", images.width,
            images.height, images.bits, seek * 1000, render * 1000, perFrame * 1000, 1.0 / perFrame, params.width, params.height);
 
